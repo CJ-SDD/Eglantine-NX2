@@ -150,6 +150,9 @@ public:
     /// Notify the host renderer to wait for previous primitive and compute operations.
     virtual void WaitForIdle() = 0;
 
+    /// Emulate the NX2 PBDMA memory barrier when the backend requires an explicit barrier.
+    virtual void Nx2Membar() {}
+
     /// Notify the host renderer to wait for reads and writes to render targets and flush caches.
     virtual void FragmentBarrier() = 0;
 
