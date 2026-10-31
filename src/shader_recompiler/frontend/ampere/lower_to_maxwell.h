@@ -1290,22 +1290,28 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             emit(0x5c18000000000000ULL | predicate | dest | (u64{248} << 8) | (u64{247} << 20) | (u64{16} << 39));
             break;
         }
-        case 0x23c: { // HMMA.16816.F16: D(16x8) = A(16x16) * B(16x8) + C, f16 fragments.
+        case 0x23c: { // HMMA.1688/.16816.F16: D = A(depth x 16 or depth x 8) * B + C, f16 fragments.
             // Lane t (group g = t/4, i = t%4): A regs hold rows g / g+8 at k 2i..2i+1 (a0, a1) and
             // 8+2i.. (a2, a3); B regs hold k 2i.. (b0) / 8+2i.. (b1) of column g; D holds rows
-            // g / g+8 at columns 2i, 2i+1. Rebuilt from shuffles with HFMA2, accumulating in R252/R253.
-            // The expansion is correct but large: title 4's 372-HMMA network takes the host driver
-            // minutes to compile, once (the pipeline is cached). Rejecting the program instead left
-            // Donkey Kong Bananza's whole scene flat lilac and Splatoon Raiders washed out, because the
-            // compute pass that composes it never ran, so emulation is the default. tensor_mode comes
-            // from EDEN_NX2_TENSOR (shader_environment.cpp): "stub" makes every HMMA D = C (fast, wrong
-            // colours), "off"/"0" rejects the program, anything else (or empty) emulates.
+            // g / g+8 at columns 2i, 2i+1.
+            // The unit sums the eight products of one k group in f32 and rounds the sum to f16 once,
+            // so the emulation keeps four f32 accumulators and converts after every eight products.
+            // Accumulating with HFMA2 instead (a rounding per product) tints Splatoon Raiders' whole
+            // scene yellow; the two disagree by more than f16 rounding because the sums sit near the
+            // top of the f16 range. Rejecting the program is the escape hatch: a pass that never runs
+            // leaves DK Bananza's scene flat lilac.
+            static const char* const mode_env = std::getenv("EDEN_NX2_TENSOR");
+            const std::string_view tensor_mode{mode_env ? mode_env : ""};
             if (tensor_mode == "off" || tensor_mode == "0")
                 return fail(index, "native matrix multiply (EDEN_NX2_TENSOR=off)");
             const u32 a = insn.Bits(24, 8), b = insn.Bits(32, 8), c = insn.Bits(64, 8);
-            if ((insn.words[1] & ~0xffU) || (insn.words[2] & ~0xffU) != 0x800 || dest + 2 > 246 ||
-                a + 4 > 246 || b + 2 > 246 || (c != 255 && c + 2 > 246))
-                return fail(index, "native matrix multiply mode");
+            const u32 form = insn.words[2] & ~0xffU;
+            const u32 depth = form == 0 ? 8U : 16U;
+            const u32 a_count = depth / 4, b_count = depth / 8;
+            if (native_predicate != 7 || (form != 0 && form != 0x800) || (insn.words[1] & ~0xffU) ||
+                (dest & 1) || dest + 2 > 246 || (a & (a_count - 1)) || a + a_count > 246 ||
+                (b & (b_count - 1)) || b + b_count > 246 || (c != 255 && ((c & 1) || c + 2 > 246)))
+                return fail(index, "native half matrix multiply mode");
             if (tensor_mode == "stub") {
                 for (u32 row = 0; row < 2; ++row) {
                     if (c == 255) mov_imm(static_cast<u32>(dest) + row, 0);
@@ -1313,51 +1319,61 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 }
                 break;
             }
-            const auto shuffle = [&](u32 target, u32 source_reg) {
-                emit(0xef10000000000000ULL | predicate | target | (u64{source_reg} << 8) | (u64{246} << 20) |
-                     (u64{1} << 29) | (u64{31} << 34) | (u64{7} << 48));
+            const auto add = [&](u32 target, u32 lhs, u32 rhs) {
+                emit(0x5c10000000000000ULL | predicate | target | (u64{lhs} << 8) | (u64{rhs} << 20));
             };
-            const auto lane_a = [&](u32 i) { // 4g + i
-                emit(0xf0c8000000000000ULL | predicate | 246);
-                emit(0x0400000000000000ULL | predicate | 246 | (u64{246} << 8) | (u64{0x1c} << 20));
-                if (i) emit(0x1c00000000000000ULL | predicate | 246 | (u64{246} << 8) | (u64{i} << 20));
+            const auto shuffle_lane = [&](u32 target, u32 source, u32 lane) {
+                emit(0xef10000000000000ULL | predicate | target | (u64{source} << 8) |
+                     (u64{lane} << 20) | (u64{1} << 29) | (u64{0x1f} << 34) | (u64{7} << 48));
             };
-            const auto lane_b = [&](u32 add) { // 8(t%4) + add: column 2(t%4) (+1 when add >= 4)
-                emit(0xf0c8000000000000ULL | predicate | 246);
-                emit(0x0400000000000000ULL | predicate | 246 | (u64{246} << 8) | (u64{3} << 20));
-                emit(0x3848000000000000ULL | predicate | 246 | (u64{246} << 8) | (u64{3} << 20));
-                if (add) emit(0x1c00000000000000ULL | predicate | 246 | (u64{246} << 8) | (u64{add} << 20));
+            const auto round_half = [&](u32 reg) {
+                emit(0x5ca8000000000000ULL | predicate | reg | (u64{1} << 8) |
+                     (u64{2} << 10) | (u64{reg} << 20));
             };
-            const auto hfma2 = [&](u32 accumulator, u32 swizzle_a, u32 pair) {
-                emit(0x5d00000000000000ULL | predicate | accumulator | (u64{251} << 8) | (u64{pair} << 20) |
-                     (u64{accumulator} << 39) | (u64{swizzle_a} << 47));
+            const auto fma = [&](u32 target, u32 lhs, u32 rhs) {
+                emit(0x5980000000000000ULL | predicate | target | (u64{lhs} << 8) |
+                     (u64{rhs} << 20) | (u64{target} << 39));
             };
+            // R240..R243: D rows g / g+8, columns 2i (even k) and 2i+1 (odd k), in f32.
             for (u32 row = 0; row < 2; ++row) {
-                if (c == 255) mov_imm(252 + row, 0);
-                else emit(0x5c98000000000000ULL | predicate | (252 + row) | (u64{15} << 39) | (u64{c + row} << 20));
+                for (u32 col = 0; col < 2; ++col) {
+                    extract_half({c == 255 ? 255U : c + row, 0, false, false}, col, 240 + row * 2 + col);
+                }
             }
-            for (u32 i = 0; i < 4; ++i) {
-                for (u32 k_block = 0; k_block < 2; ++k_block) {
-                    lane_b(i);
-                    shuffle(247, b + k_block);
-                    lane_b(4 + i);
-                    shuffle(248, b + k_block);
-                    // P0 = (B[2i][2t], B[2i][2t+1]), P1 = (B[2i+1][2t], B[2i+1][2t+1])
-                    emit(0x0400000000000000ULL | predicate | 249 | (u64{247} << 8) | (u64{0xffff} << 20));
-                    emit(0x5c18000000000000ULL | predicate | 249 | (u64{248} << 8) | (u64{249} << 20) | (u64{16} << 39));
-                    emit(0x3828000000000000ULL | predicate | 250 | (u64{247} << 8) | (u64{16} << 20));
-                    emit(0x0400000000000000ULL | predicate | 248 | (u64{248} << 8) | (u64{0xffff0000} << 20));
-                    emit(0x5c10000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{248} << 20));
+            emit(0xf0c8000000000000ULL | predicate | 250);                                    // laneid
+            emit(0x0400000000000000ULL | predicate | 251 | (u64{250} << 8) | (u64{0x1c} << 20));
+            emit(0x0400000000000000ULL | predicate | 252 | (u64{250} << 8) | (u64{3} << 20));
+            emit(0x3848000000000000ULL | predicate | 252 | (u64{252} << 8) | (u64{3} << 20));  // 8(t%4)
+            for (u32 pair = 0; pair < depth / 2; ++pair) {
+                mov_imm(253, pair & 3);
+                add(254, 252, 253);
+                add(253, 251, 253);                                                           // A lane 4g+i
+                shuffle_lane(244, a + (pair >= 4 ? 2 : 0), 253);
+                shuffle_lane(245, a + (pair >= 4 ? 3 : 1), 253);
+                shuffle_lane(246, b + pair / 4, 254);                                         // B lane 8(t%4)+i
+                mov_imm(253, 4);
+                add(254, 254, 253);
+                shuffle_lane(247, b + pair / 4, 254);
+                for (u32 half = 0; half < 2; ++half) {
+                    extract_half({246, 0, false, false}, half, 253);
+                    extract_half({247, 0, false, false}, half, 254);
                     for (u32 row = 0; row < 2; ++row) {
-                        lane_a(i);
-                        shuffle(251, a + k_block * 2 + row);
-                        hfma2(252 + row, 2, 249); // A.H0 broadcast * P0
-                        hfma2(252 + row, 3, 250); // A.H1 broadcast * P1
+                        extract_half({244 + row, 0, false, false}, half, 250);
+                        fma(240 + row * 2, 250, 253);
+                        fma(241 + row * 2, 250, 254);
+                    }
+                }
+                if ((pair & 3) == 3) {
+                    for (u32 reg = 240; reg < 244; ++reg) {
+                        round_half(reg);
+                        if (pair + 1 < depth / 2) extract_half({reg, 2, false, false}, 0, reg);
                     }
                 }
             }
-            for (u32 row = 0; row < 2; ++row)
-                emit(0x5c98000000000000ULL | predicate | (dest + row) | (u64{15} << 39) | (u64{252 + row} << 20));
+            for (u32 row = 0; row < 2; ++row) {
+                emit(0x5c18000000000000ULL | predicate | (dest + row) |
+                     (u64{241 + row * 2} << 8) | (u64{240 + row * 2} << 20) | (u64{16} << 39));
+            }
             break;
         }
         case 0x83b: { // LDSM.16.M88.{1,2,4} (ldmatrix): 8x8 16-bit matrices from shared memory.
