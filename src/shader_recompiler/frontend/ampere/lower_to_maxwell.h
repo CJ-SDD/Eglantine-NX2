@@ -1294,13 +1294,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // Lane t (group g = t/4, i = t%4): A regs hold rows g / g+8 at k 2i..2i+1 (a0, a1) and
             // 8+2i.. (a2, a3); B regs hold k 2i.. (b0) / 8+2i.. (b1) of column g; D holds rows
             // g / g+8 at columns 2i, 2i+1. Rebuilt from shuffles with HFMA2, accumulating in R252/R253.
-            // The expansion is correct but large: title 4's 372-HMMA network is kept compact here
-            // because host-driver compilation cost grows sharply with the emitted instruction count.
-            // Full emulation is required for this title's upscaler. Keep the diagnostic stub
-            // available explicitly, but reject HMMA unless the backend opts in.
-            if (tensor_mode.empty()) {
-                return fail(index, "native matrix multiply requires EDEN_NX2_TENSOR=full");
-            }
+            // The expansion is correct but large: title 4's 372-HMMA network takes the host driver
+            // minutes to compile, once (the pipeline is cached). Rejecting the program instead left
+            // Donkey Kong Bananza's whole scene flat lilac and Splatoon Raiders washed out, because the
+            // compute pass that composes it never ran, so emulation is the default. tensor_mode comes
+            // from EDEN_NX2_TENSOR (shader_environment.cpp): "stub" makes every HMMA D = C (fast, wrong
+            // colours), "off"/"0" rejects the program, anything else (or empty) emulates.
+            if (tensor_mode == "off" || tensor_mode == "0")
+                return fail(index, "native matrix multiply (EDEN_NX2_TENSOR=off)");
             const u32 a = insn.Bits(24, 8), b = insn.Bits(32, 8), c = insn.Bits(64, 8);
             if ((insn.words[1] & ~0xffU) || (insn.words[2] & ~0xffU) != 0x800 || dest + 2 > 246 ||
                 a + 4 > 246 || b + 2 > 246 || (c != 255 && c + 2 > 246))
