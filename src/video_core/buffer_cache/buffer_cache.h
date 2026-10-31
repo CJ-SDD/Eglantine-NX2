@@ -101,6 +101,7 @@ void BufferCache<P>::TickFrame() {
         return;
     }
     runtime.TickFrame(slot_buffers);
+    native_indirect_uniforms_this_frame.clear();
     if (static u64 frames{}; ++frames % 600 == 0) {
         u64 total{};
         size_t count{};
@@ -1032,6 +1033,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             return alignment > 1 && (offset % alignment) != 0;
         }
     }();
+    // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
+    // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
+    // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
+    if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
+        size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
+        !memory_tracker.IsRegionGpuModified(device_addr, size) &&
+        native_indirect_uniforms_this_frame.insert(device_addr).second) {
+        // The bank size is only an upper limit: stop at the end of the mapped memory.
+        u64 mapped_size = 0;
+        while (mapped_size < size &&
+               device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
+            mapped_size += DEVICE_PAGESIZE - ((device_addr + mapped_size) & DEVICE_PAGEMASK);
+        }
+        if (mapped_size != 0) {
+            memory_tracker.MarkRegionAsCpuModified(device_addr, (std::min<u64>)(mapped_size, size));
+        }
+    }
     const bool use_fast_buffer = needs_alignment_stream
         || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
             && !memory_tracker.IsRegionGpuModified(device_addr, size));
