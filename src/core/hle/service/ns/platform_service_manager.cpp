@@ -85,10 +85,13 @@ struct IPlatformServiceManager::Impl {
     // Automatically populated based on shared_fonts dump or system archives.
     // 6 builtin fonts + extra 2 for whatever may come after
     boost::container::static_vector<FontRegion, 8> shared_font_regions;
-    /// Plain TTF copies of the same fonts (Switch 2 GetBuiltInFontData), after the BFTTF data.
+    /// Plain TTF copies of the same fonts (Switch 2 GetBuiltInFontData).
     boost::container::static_vector<FontRegion, 8> builtin_font_regions;
     /// Backing memory for the shared font data
     std::array<u8, SHARED_FONT_MEM_SIZE> shared_font;
+    /// The plain copies, in their own shared memory: firmware fonts fill SHARED_FONT_MEM_SIZE alone.
+    std::vector<u8> builtin_fonts;
+    Kernel::KSharedMemory* builtin_font_memory{};
 };
 
 IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const char* service_name_)
@@ -166,26 +169,38 @@ IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const ch
     }
 
     for (const auto& plain : plain_fonts) {
-        offset = Common::AlignUp(offset, 0x1000);
-        if (offset + plain.size() > SHARED_FONT_MEM_SIZE) {
-            LOG_WARNING(Service_NS, "No shared memory left for plain built-in font copies");
-            break;
-        }
-        std::memcpy(impl->shared_font.data() + offset, plain.data(), plain.size());
-        impl->builtin_font_regions.push_back({u32(offset), u32(plain.size())});
-        offset += plain.size();
+        const size_t start = Common::AlignUp(impl->builtin_fonts.size(), 0x1000);
+        impl->builtin_fonts.resize(start + plain.size());
+        std::memcpy(impl->builtin_fonts.data() + start, plain.data(), plain.size());
+        impl->builtin_font_regions.push_back({u32(start), u32(plain.size())});
     }
 }
 
 // Switch 2: the shared memory GetBuiltInFontData offsets point into (copy handle, u32 size); the
-// SDK maps it read-only. Eden serves its font shared memory, which holds plain copies too.
+// SDK maps it read-only with the size given here.
 void IPlatformServiceManager::GetBuiltInFontSharedMemory(HLERequestContext& ctx) {
     LOG_WARNING(Service_NS, "(STUBBED) Switch 2 GetBuiltInFontSharedMemory");
-    std::memcpy(kernel.GetFontSharedMem().GetPointer(), impl->shared_font.data(), impl->shared_font.size());
+    const size_t size = Common::AlignUp(impl->builtin_fonts.size(), Kernel::PageSize);
+    if (impl->builtin_font_memory == nullptr) {
+        auto* const memory = Kernel::KSharedMemory::Create(kernel);
+        const Result result = memory->Initialize(kernel, system.DeviceMemory(), nullptr,
+                                                 Kernel::Svc::MemoryPermission::None,
+                                                 Kernel::Svc::MemoryPermission::Read, size);
+        if (result.IsError()) {
+            LOG_ERROR(Service_NS, "Could not allocate {:#x} bytes for the built-in fonts", size);
+            memory->Close(kernel);
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(result);
+            return;
+        }
+        Kernel::KSharedMemory::Register(kernel, memory);
+        std::memcpy(memory->GetPointer(), impl->builtin_fonts.data(), impl->builtin_fonts.size());
+        impl->builtin_font_memory = memory;
+    }
     IPC::ResponseBuilder rb{ctx, 3, 1};
     rb.Push(ResultSuccess);
-    rb.Push<u32>(static_cast<u32>(SHARED_FONT_MEM_SIZE));
-    rb.PushCopyObjects(ctx, kernel.GetFontSharedMem());
+    rb.Push<u32>(static_cast<u32>(size));
+    rb.PushCopyObjects(ctx, impl->builtin_font_memory);
 }
 
 // nn::pl::GetBuiltInFontData(BuiltInFontDataOunce*, BuiltInFontTypeOunce, bool): returns a 16-byte
@@ -212,7 +227,11 @@ void IPlatformServiceManager::GetBuiltInFontData(HLERequestContext& ctx) {
     rb.Push<u32>(0);
 }
 
-IPlatformServiceManager::~IPlatformServiceManager() = default;
+IPlatformServiceManager::~IPlatformServiceManager() {
+    if (impl->builtin_font_memory != nullptr) {
+        impl->builtin_font_memory->Close(kernel);
+    }
+}
 
 Result IPlatformServiceManager::RequestLoad(SharedFontType type) {
     // Games don't call this so all fonts should be loaded
