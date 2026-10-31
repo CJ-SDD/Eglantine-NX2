@@ -509,12 +509,10 @@ struct Values {
     SwitchableSetting<u8, false> bg_blue{
                                          linkage, 0, "bg_blue", Category::Renderer, Specialization::Default, true, true};
 
+    // Low by default: the accurate path (High) leaves the mission world black and the dialogue box
+    // flickering in Splatoon Raiders, and the same stale reads show up in other Switch 2 titles.
     SwitchableSetting<GpuAccuracy, true> gpu_accuracy{linkage,
-#ifdef __ANDROID__
                                                       GpuAccuracy::Low,
-#else
-                                                      GpuAccuracy::High,
-#endif
                                                       "gpu_accuracy",
                                                       Category::RendererAdvanced,
                                                       Specialization::Default,
