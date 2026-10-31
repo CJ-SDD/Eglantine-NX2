@@ -1428,9 +1428,12 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             break;
         }
         case 0xb6f: { // TXQ texture dimensions, two packed scalar outputs.
-            if (insn.Bits(59, 5) || insn.Bits(64, 8) != 255 || insn.Bits(72, 4) == 0 || insn.Bits(72, 4) > 3 ||
+            // Mask 4 asks for the depth or layer count alone (Splatoon Raiders vertex shaders).
+            const u32 query_mask = insn.Bits(72, 4);
+            if (insn.Bits(59, 5) || insn.Bits(64, 8) != 255 || query_mask == 0 ||
+                (query_mask > 4 && query_mask != 8) ||
                 insn.Bits(76, 14) || insn.Bits(91, 1) || insn.Bits(54, 5) >= 18 ||
-                insn.Bits(40, 14) > 0x1fff || (insn.Bits(72, 4) == 3 && (dest & 1)) || dest >= 254)
+                insn.Bits(40, 14) > 0x1fff || (query_mask == 3 && (dest & 1)) || dest >= 254)
                 return fail(index, "native texture dimension query mode");
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != insn.Bits(54, 5))
                 return fail(index, "native texture descriptor buffer conflict");
