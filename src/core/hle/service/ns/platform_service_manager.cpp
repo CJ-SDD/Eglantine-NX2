@@ -188,28 +188,26 @@ void IPlatformServiceManager::GetBuiltInFontSharedMemory(HLERequestContext& ctx)
     rb.PushCopyObjects(ctx, kernel.GetFontSharedMem());
 }
 
-// nn::pl::GetBuiltInFontData(BuiltInFontDataOunce*, BuiltInFontTypeOunce, bool): returns a 16-byte
-// bool that says whether the font exists and a 16-byte descriptor (u8 flags, u8 flag bit, u16,
-// u32 offset into the font shared memory, u32 size, u32). The client expects plain TrueType/OpenType data
-// there. The type numbering is unknown, so types map onto Eden's shared fonts in order.
+// nn::pl::GetBuiltInFontData(BuiltInFontDataOunce*, BuiltInFontTypeOunce, bool): the request is
+// {u8 type, u8 flag}. The reply is a bool followed by a 12-byte descriptor at offset 4 (u8 flags,
+// u8 flag bit, u16, u32 offset into the font shared memory, u32 size). The client expects plain
+// TrueType/OpenType data there. The type numbering is unknown, so types map onto Eden's shared
+// fonts in order.
 void IPlatformServiceManager::GetBuiltInFontData(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
-    const u32 type = rp.Pop<u32>();
+    const u8 type = rp.Pop<u8>();
     const bool flag = rp.Pop<u8>() != 0;
     const auto& regions = impl->builtin_font_regions;
-    const bool found = !regions.empty();
-    const FontRegion region = found ? regions[std::min<size_t>(type, regions.size() - 1)] : EMPTY_REGION;
+    const bool found = type < regions.size();
+    const FontRegion region = found ? regions[type] : EMPTY_REGION;
     LOG_WARNING(Service_NS, "(STUBBED) Switch 2 GetBuiltInFontData type={} flag={} -> offset={:#x} size={:#x}",
                 type, flag, region.offset, region.size);
-    // Raw reply: the bool at offset 0, the descriptor at offset 8.
-    IPC::ResponseBuilder rb{ctx, 2 + 6};
+    IPC::ResponseBuilder rb{ctx, 2 + 4};
     rb.Push(ResultSuccess);
     rb.Push<u32>(found ? 1 : 0);
     rb.Push<u32>(0);
-    rb.Push<u32>(0);
     rb.Push<u32>(region.offset);
     rb.Push<u32>(region.size);
-    rb.Push<u32>(0);
 }
 
 IPlatformServiceManager::~IPlatformServiceManager() = default;
