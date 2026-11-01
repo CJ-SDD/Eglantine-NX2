@@ -1821,9 +1821,10 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         case 0x387: case 0x983: { // Captured scalar local spill at an immediate byte offset.
             const bool store = opcode == 0x387;
             const u32 data = insn.Bits(32, 8), offset = insn.Bits(40, 24);
-            if (insn.Bits(24, 8) != 255 || (store && (insn.Bits(16, 8) || data > 247)) ||
+            // Bits 84-86 are the cache eviction hint, which local memory emulation ignores.
+            if (insn.Bits(24, 8) != 255 || (store && (insn.Bits(16, 8) || (data > 247 && data != 255))) ||
                 (!store && (data || dest >= 248)) || (offset & 3) || offset > 0x7fffff ||
-                insn.words[2] != (store ? 0x00100800U : 0x00300800U))
+                (insn.words[2] & ~0x00700000U) != 0x00000800U)
                 return fail(index, "native local scalar spill mode");
             emit((store ? 0xef50000000000000ULL : 0xef40000000000000ULL) | predicate |
                  (store ? data : dest) | (u64{255} << 8) | (u64{offset} << 20) | (u64{4} << 48));
