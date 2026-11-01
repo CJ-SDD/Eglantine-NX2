@@ -1395,13 +1395,13 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         const auto emit = [&](u32 address, u32 value) {
                 if (address >= 0xe00) return false;
                 if (address == 0x556) {
-                    // SET_RENDER_ENABLE_OVERRIDE: 0 use the render-enable condition, 1 always,
-                    // 2 never. Log a histogram every 20000 macro writes (pop-in diagnostics).
+                    // SET_RENDER_ENABLE_C (render_enable.mode): 0 false, 1 true, 2 conditional,
+                    // 3+ compare. Log a histogram every 20000 macro writes (pop-in diagnostics).
                     static std::array<u64, 4> modes{};
                     static u64 enable_writes{};
                     ++modes[value & 3];
                     if (++enable_writes % 20000 == 0) {
-                        LOG_INFO(HW_GPU, "Native MME render enable modes: use {} always {} never {} other {}",
+                        LOG_INFO(HW_GPU, "Native MME render enable modes: false {} true {} conditional {} compare {}",
                                  modes[0], modes[1], modes[2], modes[3]);
                     }
                 }
@@ -1432,6 +1432,11 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                             }
                         }
                     }
+                    // Switch 2 macros read occlusion reports here and set the render enable from
+                    // them (Mario Tennis Fever's characters). Results the host GPU has finished
+                    // reach guest memory only at the next fence: write them now, or the macro reads
+                    // a zero count and hides the object.
+                    memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
                     if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
                         static u64 flushes{};
