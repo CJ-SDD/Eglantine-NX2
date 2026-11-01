@@ -14,6 +14,9 @@ See also: [Dolphin emulator](hhttps://github.com/dolphin-emu/dolphin/blob/cdbea8
 | AMD | All | Proprietary | ? | On GCN, 2D mipmapped texture arrays (with width == height) where there are more than 6 layers causes broken corrupt mipmaps. |
 | AMD | All | RADV, MESA | ? | Using LLVM emitter causes corrupt FP16, proprietary drivers unaffected. |
 | AMD | All | Proprietary | ? | Incorrect implementation of VK_EXT_depth_clamp_control causes incorrect depth values to be written to the depth buffer. |
+| AMD Radeon RX 5700 XT | Windows | Proprietary | 2.0.353 | Concurrent Donkey Kong Bananza pipeline compilation can crash the process. |
+| AMD Radeon RX 5700 XT | Windows | Proprietary | 2.0.353 | Standalone Position inputs can crash geometry shader compilation. |
+| AMD Radeon RX 5700 XT | Windows | Proprietary | 2.0.353 | Geometry shaders exporting every generic location can crash pipeline compilation. |
 | AMD | macOS | Proprietary | ? | `gl_HelperInvocation` is actually `!gl_HelperInvocation`. |
 | NVIDIA | All | Proprietary | ? | Drivers for ampere and newer have broken float16 math. |
 | NVIDIA | All | Proprietary | >=510.0.0 | Versions >= 510 do not support MSAA->MSAA image blits. |
