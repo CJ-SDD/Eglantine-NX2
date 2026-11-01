@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 
 #include <Hypervisor/Hypervisor.h>
@@ -56,6 +58,12 @@ constexpr u64 SctlrRes1 = (1ULL << 11) | (1ULL << 20) | (1ULL << 22) | (1ULL << 
 
 int g_logged_faults{};
 
+s64 NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 } // namespace
 
 struct ArmHypervisor::Vcpu {
@@ -75,7 +83,12 @@ struct ArmHypervisor::Vcpu {
 };
 
 ArmHypervisor::ArmHypervisor(System& system, Kernel::KProcess* process, std::size_t core_index)
-    : ArmInterface{true}, m_system{system}, m_process{process}, m_core_index{core_index} {}
+    : ArmInterface{true}, m_system{system}, m_process{process}, m_core_index{core_index} {
+    const char* stats = std::getenv("EDEN_NX2_HYPERVISOR_STATS");
+    m_stats_enabled = stats != nullptr && stats[0] == '1';
+    LOG_INFO(Core_ARM, "Hypervisor: core {} runs natively{}", core_index,
+             m_stats_enabled ? ", exit statistics on" : "");
+}
 
 ArmHypervisor::~ArmHypervisor() = default;
 
@@ -265,9 +278,38 @@ ArmHypervisor::Resolution ArmHypervisor::HandleLowerSync(Vcpu& vcpu, u64 esr, u6
     }
 }
 
+void ArmHypervisor::CountAndReport(u64 run_ns) {
+    m_stats.native_ns += run_ns;
+    const s64 now = NowNs();
+    if (m_stats.window_start_ns == 0) {
+        m_stats.window_start_ns = now;
+        return;
+    }
+    const s64 window = now - m_stats.window_start_ns;
+    if (window < 10'000'000'000LL) {
+        return;
+    }
+    const double seconds = static_cast<double>(window) / 1e9;
+    const auto per_s = [seconds](u64 n) { return static_cast<u64>(static_cast<double>(n) / seconds); };
+    const u64 exits = m_stats.svc + m_stats.counter + m_stats.data_abort + m_stats.interrupt +
+                      m_stats.cancel + m_stats.vtimer + m_stats.other;
+    LOG_INFO(Core_ARM,
+             "Hypervisor core {}: native {:.0f}% of the time, {} exits/s (SVC {}, counter {}, "
+             "data abort {}, interrupt {}, kick {}, vtimer {}, other {}), {} runs/s",
+             m_core_index, 100.0 * static_cast<double>(m_stats.native_ns) / static_cast<double>(window),
+             per_s(exits), per_s(m_stats.svc), per_s(m_stats.counter), per_s(m_stats.data_abort),
+             per_s(m_stats.interrupt), per_s(m_stats.cancel), per_s(m_stats.vtimer),
+             per_s(m_stats.other), per_s(m_stats.runs));
+    m_stats = Stats{};
+    m_stats.window_start_ns = now;
+}
+
 HaltReason ArmHypervisor::RunThread(Kernel::KThread* thread) {
     if (m_break.exchange(false)) {
         return HaltReason::BreakLoop;
+    }
+    if (m_stats_enabled) {
+        m_stats.runs++;
     }
 
     auto& vm = Hv::Vm::Get();
@@ -311,7 +353,12 @@ HaltReason ArmHypervisor::RunThread(Kernel::KThread* thread) {
         }
         resume_as_is = false;
 
-        if (hv_vcpu_run(id) != HV_SUCCESS) {
+        const s64 run_start = m_stats_enabled ? NowNs() : 0;
+        const hv_return_t run_result = hv_vcpu_run(id);
+        if (m_stats_enabled) {
+            CountAndReport(static_cast<u64>(NowNs() - run_start));
+        }
+        if (run_result != HV_SUCCESS) {
             LOG_CRITICAL(Core_ARM, "Hypervisor: hv_vcpu_run failed");
             ReadState(vcpu);
             return HaltReason::PrefetchAbort;
@@ -320,6 +367,7 @@ HaltReason ArmHypervisor::RunThread(Kernel::KThread* thread) {
         const hv_vcpu_exit_t& exit = *vcpu.exit;
         switch (exit.reason) {
         case HV_EXIT_REASON_CANCELED: {
+            m_stats.cancel++;
             u64 cpsr{}, pc{};
             hv_vcpu_get_reg(id, HV_REG_CPSR, &cpsr);
             hv_vcpu_get_reg(id, HV_REG_PC, &pc);
@@ -335,6 +383,7 @@ HaltReason ArmHypervisor::RunThread(Kernel::KThread* thread) {
             continue;
         }
         case HV_EXIT_REASON_VTIMER_ACTIVATED:
+            m_stats.vtimer++;
             hv_vcpu_set_vtimer_mask(id, true);
             resume_as_is = true;
             continue;
@@ -364,6 +413,20 @@ HaltReason ArmHypervisor::RunThread(Kernel::KThread* thread) {
 
         const u64 vector = syndrome & 0xFFFF;
         if (vector == VectorLowerSync) {
+            switch (ExceptionClass(esr)) {
+            case EcSvc64:
+                m_stats.svc++;
+                break;
+            case EcSysReg:
+                m_stats.counter++;
+                break;
+            case EcDataAbortLower:
+                m_stats.data_abort++;
+                break;
+            default:
+                m_stats.other++;
+                break;
+            }
             HaltReason reason{};
             if (HandleLowerSync(vcpu, esr, far, elr, spsr, reason) == Resolution::Return) {
                 ReadState(vcpu);
@@ -373,6 +436,7 @@ HaltReason ArmHypervisor::RunThread(Kernel::KThread* thread) {
         }
         if (vector > VectorLowerSync) {
             // An interrupt or SError from guest code: nothing to deliver, resume it.
+            m_stats.interrupt++;
             m_ctx.pc = elr;
             m_ctx.pstate = static_cast<u32>(spsr & NzcvMask);
             continue;

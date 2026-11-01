@@ -88,6 +88,16 @@ private:
     std::atomic<bool> m_running{};
     std::atomic<u64> m_running_vcpu{~u64{0}};
 
+    // Exit statistics, logged every 10 seconds per core (EDEN_NX2_HYPERVISOR_STATS=1).
+    struct Stats {
+        u64 runs{}, svc{}, counter{}, data_abort{}, interrupt{}, cancel{}, vtimer{}, other{};
+        u64 native_ns{};
+        s64 window_start_ns{};
+    };
+    void CountAndReport(u64 run_ns);
+    Stats m_stats{};
+    bool m_stats_enabled{};
+
     u64 m_last_fault_page{~u64{0}};
     u32 m_fault_repeats{};
 };
