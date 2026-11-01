@@ -145,18 +145,8 @@ public:
             return false;
         }
 
-        // Allocate backing file map. On hosts with less RAM than the 20 GiB Switch 2 layout the
-        // commit can fail (ERROR_COMMITMENT_LIMIT or ERROR_NO_SYSTEM_RESOURCES) until Windows has
-        // grown the page file, which it starts doing on the failed request, so retry briefly.
-        for (int attempt = 0; attempt < 4; ++attempt) {
-            backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
-            const DWORD error = backing_handle ? 0 : GetLastError();
-            if (backing_handle || (error != ERROR_COMMITMENT_LIMIT && error != ERROR_NO_SYSTEM_RESOURCES)) {
-                break;
-            }
-            LOG_WARNING(HW_Memory, "Backing memory allocation attempt {} failed with error {}, retrying", attempt + 1, error);
-            Sleep(500);
-        }
+        // Allocate backing file map
+        backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
         if (!backing_handle) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate {} MiB of backing memory, error {}", backing_size >> 20, GetLastError());
             return false;
