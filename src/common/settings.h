@@ -989,6 +989,10 @@ u64 GetCurrentProgramID();
 // Whether the program being loaded is a Switch 2 one (set by the core before the GPU starts).
 void SetCurrentProgramIsSwitch2(bool is_switch2);
 bool CurrentProgramIsSwitch2();
+/// Switch 2 titles draw everything their occlusion queries gate: the query results reach the
+/// guest late, so conditional draws (characters) dropped out. EDEN_NX2_CONDITIONAL_RENDERING=1
+/// keeps the conditions.
+bool IgnoreSwitch2ConditionalRendering();
 
 bool IsOpenGL();
 

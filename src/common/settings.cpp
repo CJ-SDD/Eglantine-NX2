@@ -7,6 +7,7 @@
 #include <version>
 #if __cpp_lib_chrono >= 201907L
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <stdexcept>
 #endif
@@ -233,6 +234,14 @@ void SetCurrentProgramIsSwitch2(bool is_switch2) {
 
 bool CurrentProgramIsSwitch2() {
     return current_program_is_switch2;
+}
+
+bool IgnoreSwitch2ConditionalRendering() {
+    static const bool keep = [] {
+        const char* value = std::getenv("EDEN_NX2_CONDITIONAL_RENDERING");
+        return value != nullptr && value[0] == '1';
+    }();
+    return current_program_is_switch2 && !keep;
 }
 
 bool IsDockedMode() {

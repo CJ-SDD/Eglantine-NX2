@@ -627,7 +627,7 @@ void Maxwell3D::ProcessQueryGet() {
 }
 
 void Maxwell3D::ProcessQueryCondition() {
-    if (rasterizer->AccelerateConditionalRendering()) {
+    if (rasterizer->AccelerateConditionalRendering() || Settings::IgnoreSwitch2ConditionalRendering()) {
         execute_on = true;
         return;
     }
