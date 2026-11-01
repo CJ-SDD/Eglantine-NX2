@@ -117,7 +117,8 @@ constexpr Common::MemoryPermission ConvertToMemoryPermission(KMemoryPermission p
     if (True(perm & KMemoryPermission::UserWrite)) {
         perms |= Common::MemoryPermission::Write;
     }
-#ifdef HAS_NCE
+#if defined(HAS_NCE) || defined(HAS_HYPERVISOR)
+    // Native execution (NCE, or Hypervisor.framework on macOS) needs code pages executable.
     if (True(perm & KMemoryPermission::UserExecute)) {
         perms |= Common::MemoryPermission::Execute;
     }
