@@ -779,13 +779,15 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                  (u64{(high_result ? high : low) + 216} << 8) | (u64{insn.words[1]} << 20));
             break;
         }
-        case 0xb82: { // LDC, 8 to 64 bits, indexed byte offset
+        case 0xb82: { // LDC, 8 to 64 bits, indexed byte offset; default or .IS (segmented) addressing
             const u32 width = insn.Bits(73, 3);
-            if (width > 5 || insn.Bits(78, 2) || insn.Bits(91, 1) ||
+            const u32 mode = insn.Bits(78, 2);
+            if (width > 5 || (mode != 0 && mode != 2) || insn.Bits(91, 1) ||
                 bank() >= 18 ||
                 (width == 5 && ((dest & 1) || dest >= 254))) return fail(index, "native indexed constant load mode");
             emit(base(0xef90000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
-                 (u64{insn.Bits(38, 16)} << 20) | (u64{bank()} << 36) | (u64{width} << 48));
+                 (u64{insn.Bits(38, 16)} << 20) | (u64{bank()} << 36) | (u64{mode} << 44) |
+                 (u64{width} << 48));
             break;
         }
         case 0xf89: { // SHFL with immediate lane and segmentation/clamp mask, any mode.
@@ -1992,11 +1994,17 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         }
         case 0x306: case 0xd06: { // I2F.F32.U8, low byte, round-to-nearest (0xd06: uniform source)
             const u32 source = opcode == 0xd06 ? uniform_register(insn.Bits(32, 8)) : insn.Bits(32, 8);
-            if (opcode == 0x306 && insn.words[2] == 0x00101000 && !(insn.words[1] & 0xcfffff00U)) {
-                // I2F.U16 Rd, Rs(.H1): Maxwell's 16-bit source format, byte selector 0 or 2.
-                emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (u64{1} << 10) | (u64{source} << 20) |
-                     (u64{insn.Bits(60, 2) * 2} << 41));
-                break;
+            if (opcode == 0x306 && !(insn.words[1] & 0xcfffff00U)) {
+                // I2F.{U,S}{8,16} Rd, Rs.B<n>/.H<n>: bit 74 signed, bits 60-61 byte or half selector.
+                const u32 format = insn.words[2] & ~0x400U;
+                const u32 selector = insn.Bits(60, 2);
+                const bool half = format == 0x00101000;
+                if ((half && selector < 2) || (format == 0x1000 && (selector != 0 || insn.Bits(74, 1)))) {
+                    emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (u64{half ? 1U : 0U} << 10) |
+                         (u64{insn.Bits(74, 1)} << 13) | (u64{source} << 20) |
+                         (u64{half ? selector * 2 : selector} << 41));
+                    break;
+                }
             }
             if (insn.words[2] != (opcode == 0xd06 ? 0x08001000U : 0x1000U) ||
                 (insn.words[1] & 0xffffff00U) || source == ~0U)
