@@ -221,6 +221,10 @@ Shader::TessSpacing MaxwellToTessSpacing(u32 raw) {
 
 Shader::AttributeType ColorOutputType(u8 render_target_format) {
     const auto format = static_cast<Tegra::RenderTargetFormat>(render_target_format);
+    if (format == Tegra::RenderTargetFormat::NONE) {
+        // Unused render target: no format to look up.
+        return Shader::AttributeType::Float;
+    }
     const auto pixel_format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(format);
     if (!VideoCore::Surface::IsPixelFormatInteger(pixel_format)) {
         return Shader::AttributeType::Float;

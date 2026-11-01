@@ -28,6 +28,9 @@
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hardware_properties.h"
 #include "core/hle/kernel/k_page_table.h"
+#ifdef HAS_HYPERVISOR
+#include "core/arm/hypervisor/hv_vm.h"
+#endif
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
@@ -41,6 +44,14 @@ u32& UnmappedReadFlag() {
     thread_local u32 flag{};
     return flag;
 }
+
+#ifdef HAS_HYPERVISOR
+/// The hypervisor VM when it mirrors this page table, so its stage-1 tables follow every change.
+static inline Core::Hv::Vm* HypervisorFor(const Common::PageTable& table) {
+    auto& vm = Core::Hv::Vm::Get();
+    return vm.IsAttached(table) ? &vm : nullptr;
+}
+#endif
 
 static inline bool AddressSpaceContains(const Common::PageTable& table, const Common::ProcessAddress addr, const std::size_t size) {
     const Common::ProcessAddress max_addr = 1ULL << table.GetAddressSpaceBits();
@@ -68,6 +79,20 @@ struct Memory::Impl {
 #else
         host_buffer = std::addressof(system.DeviceMemory().buffer);
 #endif
+
+#ifdef HAS_HYPERVISOR
+        // EDEN_NX2_HYPERVISOR=1: application code runs natively in a VM whose page tables mirror
+        // this one from the start, so every mapping below reaches them.
+        // (The process's 64-bit flag is only set after this runs; a 64-bit address space,
+        // 36 or 39 bits, tells the same.)
+        if (Core::Hv::IsRequested() && process.IsApplication() &&
+            current_page_table->GetAddressSpaceBits() >= 36 && system.IsMulticore()) {
+            auto& buffer = system.DeviceMemory().buffer;
+            Core::Hv::Vm::Get().Attach(*current_page_table,
+                                       current_page_table->GetAddressSpaceBits(),
+                                       buffer.BackingBasePointer(), buffer.BackingSize());
+        }
+#endif
     }
 
     void MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
@@ -79,6 +104,11 @@ struct Memory::Impl {
                    GetInteger(target));
         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, target,
                  Common::PageType::Memory);
+#ifdef HAS_HYPERVISOR
+        if (auto* vm = HypervisorFor(page_table)) {
+            vm->Map(GetInteger(base), size, GetInteger(target), perms);
+        }
+#endif
 
         if (current_page_table->fastmem_arena) {
             host_buffer->Map(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms, separate_heap);
@@ -91,6 +121,11 @@ struct Memory::Impl {
         ASSERT_MSG((base & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, 0,
                  Common::PageType::Unmapped);
+#ifdef HAS_HYPERVISOR
+        if (auto* vm = HypervisorFor(page_table)) {
+            vm->Unmap(GetInteger(base), size);
+        }
+#endif
 
         if (current_page_table->fastmem_arena) {
             host_buffer->Unmap(GetInteger(base), size, separate_heap);
@@ -101,6 +136,12 @@ struct Memory::Impl {
                        Common::MemoryPermission perms) {
         ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
         ASSERT_MSG((vaddr & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", vaddr);
+
+#ifdef HAS_HYPERVISOR
+        if (auto* vm = HypervisorFor(page_table)) {
+            vm->Protect(vaddr, size, perms);
+        }
+#endif
 
         if (!current_page_table->fastmem_arena) {
             return;
@@ -458,6 +499,15 @@ struct Memory::Impl {
         if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
             return;
         }
+
+#ifdef HAS_HYPERVISOR
+        // Native code writes guest memory directly: protect what the GPU caches track, as fastmem
+        // does, so those writes fault and reach the caches.
+        if (auto* vm = HypervisorFor(*current_page_table)) {
+            vm->MarkCached(vaddr, size, cached,
+                           cached && Settings::values.use_reactive_flushing.GetValue());
+        }
+#endif
 
         if (current_page_table->fastmem_arena) {
             Common::MemoryPermission perm{};
