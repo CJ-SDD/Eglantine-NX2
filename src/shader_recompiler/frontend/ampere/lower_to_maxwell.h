@@ -779,13 +779,15 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                  (u64{(high_result ? high : low) + 216} << 8) | (u64{insn.words[1]} << 20));
             break;
         }
-        case 0xb82: { // LDC, 8 to 64 bits, indexed byte offset
+        case 0xb82: { // LDC, 8 to 64 bits, indexed byte offset; default or .IS (segmented) addressing
             const u32 width = insn.Bits(73, 3);
-            if (width > 5 || insn.Bits(78, 2) || insn.Bits(91, 1) ||
+            const u32 mode = insn.Bits(78, 2);
+            if (width > 5 || (mode != 0 && mode != 2) || insn.Bits(91, 1) ||
                 bank() >= 18 ||
                 (width == 5 && ((dest & 1) || dest >= 254))) return fail(index, "native indexed constant load mode");
             emit(base(0xef90000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
-                 (u64{insn.Bits(38, 16)} << 20) | (u64{bank()} << 36) | (u64{width} << 48));
+                 (u64{insn.Bits(38, 16)} << 20) | (u64{bank()} << 36) | (u64{mode} << 44) |
+                 (u64{width} << 48));
             break;
         }
         case 0xf89: { // SHFL with immediate lane and segmentation/clamp mask, any mode.
@@ -1819,9 +1821,10 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         case 0x387: case 0x983: { // Captured scalar local spill at an immediate byte offset.
             const bool store = opcode == 0x387;
             const u32 data = insn.Bits(32, 8), offset = insn.Bits(40, 24);
-            if (insn.Bits(24, 8) != 255 || (store && (insn.Bits(16, 8) || data > 247)) ||
+            // Bits 84-86 are the cache eviction hint, which local memory emulation ignores.
+            if (insn.Bits(24, 8) != 255 || (store && (insn.Bits(16, 8) || (data > 247 && data != 255))) ||
                 (!store && (data || dest >= 248)) || (offset & 3) || offset > 0x7fffff ||
-                insn.words[2] != (store ? 0x00100800U : 0x00300800U))
+                (insn.words[2] & ~0x00700000U) != 0x00000800U)
                 return fail(index, "native local scalar spill mode");
             emit((store ? 0xef50000000000000ULL : 0xef40000000000000ULL) | predicate |
                  (store ? data : dest) | (u64{255} << 8) | (u64{offset} << 20) | (u64{4} << 48));
@@ -1990,18 +1993,19 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             mov_imm(static_cast<u32>(dest) + 1, 0);
             break;
         }
-        case 0x306: case 0xd06: { // I2F.F32.U8, low byte, round-to-nearest (0xd06: uniform source)
+        case 0x306: case 0xd06: { // I2F.F32.{U,S}{8,16} Rd, Rs.B<n>/.H<n>, round-to-nearest
+            // 0xd06 takes a uniform source (bit 91). Bit 74 signed, bit 84 16-bit source,
+            // bits 60-61 byte or half selector: Maxwell I2F's bit 13, bits 10-11 and 41-42.
             const u32 source = opcode == 0xd06 ? uniform_register(insn.Bits(32, 8)) : insn.Bits(32, 8);
-            if (opcode == 0x306 && insn.words[2] == 0x00101000 && !(insn.words[1] & 0xcfffff00U)) {
-                // I2F.U16 Rd, Rs(.H1): Maxwell's 16-bit source format, byte selector 0 or 2.
-                emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (u64{1} << 10) | (u64{source} << 20) |
-                     (u64{insn.Bits(60, 2) * 2} << 41));
-                break;
-            }
-            if (insn.words[2] != (opcode == 0xd06 ? 0x08001000U : 0x1000U) ||
-                (insn.words[1] & 0xffffff00U) || source == ~0U)
+            const u32 format = insn.words[2] & ~(0x400U | (opcode == 0xd06 ? 0x08000000U : 0U));
+            const u32 selector = insn.Bits(60, 2);
+            const bool half = format == 0x00101000;
+            if ((format != 0x1000 && !half) || (half && selector > 1) ||
+                (insn.words[1] & 0xcfffff00U) || source == ~0U)
                 return fail(index, "native byte-to-float conversion mode");
-            emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (u64{source} << 20));
+            emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (u64{half ? 1U : 0U} << 10) |
+                 (u64{insn.Bits(74, 1)} << 13) | (u64{source} << 20) |
+                 (u64{half ? selector * 2 : selector} << 41));
             break;
         }
         case 0x245: case 0xa45: case 0xc45: { // I2FP.F32.U32

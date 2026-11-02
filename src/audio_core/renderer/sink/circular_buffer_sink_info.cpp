@@ -3,7 +3,6 @@
 
 #include "audio_core/renderer/memory/pool_mapper.h"
 #include "audio_core/renderer/sink/circular_buffer_sink_info.h"
-#include "audio_core/renderer/upsampler/upsampler_manager.h"
 
 namespace AudioCore::Renderer {
 
@@ -17,12 +16,10 @@ CircularBufferSinkInfo::CircularBufferSinkInfo() {
 }
 
 void CircularBufferSinkInfo::CleanUp() {
-    auto state_{reinterpret_cast<DeviceState*>(state.data())};
-
-    if (state_->upsampler_info) {
-        state_->upsampler_info->manager->Free(state_->upsampler_info);
-        state_->upsampler_info = nullptr;
-    }
+    // Circular buffer sinks own no upsampler; their state is a CircularBufferState, whose position
+    // counters would read as a DeviceState::upsampler_info pointer.
+    state.fill(0);
+    reinterpret_cast<CircularBufferState*>(state.data())->address_info.Setup(0, 0);
 
     parameter.fill(0);
     type = Type::Invalid;
