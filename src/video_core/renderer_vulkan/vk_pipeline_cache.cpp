@@ -69,10 +69,18 @@ using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 
-constexpr u32 CACHE_VERSION = 18;
+constexpr u32 CACHE_VERSION = 19;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
+
+constexpr bool IsAmdProprietaryWindows(VkDriverId driver_id) {
+#ifdef _WIN32
+    return driver_id == VK_DRIVER_ID_AMD_PROPRIETARY;
+#else
+    return false;
+#endif
+}
 
 template <typename Container>
 auto MakeSpan(Container& container) {
@@ -213,6 +221,10 @@ Shader::TessSpacing MaxwellToTessSpacing(u32 raw) {
 
 Shader::AttributeType ColorOutputType(u8 render_target_format) {
     const auto format = static_cast<Tegra::RenderTargetFormat>(render_target_format);
+    if (format == Tegra::RenderTargetFormat::NONE) {
+        // Unused render target: no format to look up.
+        return Shader::AttributeType::Float;
+    }
     const auto pixel_format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(format);
     if (!VideoCore::Surface::IsPixelFormatInteger(pixel_format)) {
         return Shader::AttributeType::Float;
@@ -429,18 +441,23 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                              DescriptorBufferRing& descriptor_buffer_ring_,
                              RenderPassCache& render_pass_cache_, BufferCache& buffer_cache_,
                              TextureCache& texture_cache_, VideoCore::ShaderNotify& shader_notify_)
-    : VideoCommon::ShaderCache{device_memory_}, device{device_}, scheduler{scheduler_},
+    : VideoCommon::ShaderCache{device_memory_, IsAmdProprietaryWindows(device_.GetDriverID())},
+      device{device_}, scheduler{scheduler_},
       descriptor_pool{descriptor_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_},
       render_pass_cache{render_pass_cache_}, buffer_cache{buffer_cache_},
       texture_cache{texture_cache_}, shader_notify{shader_notify_},
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
-      use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
+      use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
+                                !IsAmdProprietaryWindows(device_.GetDriverID())},
       // Translation threads compile in parallel with the pipeline workers: not on drivers that
       // break with parallel compiles.
       use_async_translation{use_asynchronous_shaders && IsAsyncTranslationAllowed() &&
                             !device.HasBrokenParallelShaderCompiling()},
-      use_shader_reuse{IsShaderReuseAllowed()},
+      // The known-good AMD path predates native shader reuse. Keep it disabled for this driver
+      // until its geometry-interface interaction has been validated.
+      use_shader_reuse{IsShaderReuseAllowed() &&
+                       !IsAmdProprietaryWindows(device_.GetDriverID())},
       translation_wait_budget{GetTranslationWaitBudget()},
       num_translation_threads{use_async_translation ? GetTotalTranslationWorkers() : 0},
       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
@@ -459,6 +476,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
              use_shader_reuse ? "reuse" : "do not reuse (EDEN_NX2_SHADER_REUSE=0)");
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
+    if (IsAmdProprietaryWindows(driver_id)) {
+        LOG_WARNING(Render_Vulkan,
+                    "AMD proprietary driver: disabling the Vulkan driver pipeline cache");
+    }
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
     const auto subgroup_stage_bit{[subgroup_stages](VkShaderStageFlags flag, Shader::Stage stage) {
         return (subgroup_stages & flag) != 0 ? (1u << static_cast<u32>(stage)) : 0u;
@@ -552,7 +573,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                                        driver_id == VK_DRIVER_ID_MESA_TURNIP,
 
         .has_broken_spirv_clamp = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS,
-        .has_broken_spirv_position_input = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
+        .has_broken_spirv_position_input =
+            driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
+            IsAmdProprietaryWindows(driver_id),
         .has_broken_unsigned_image_offsets = false,
         .has_broken_signed_operations = false,
         .has_broken_fp16_float_controls = driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY,
@@ -1143,6 +1166,37 @@ std::shared_ptr<ReusableShaders> PipelineCache::BuildGraphicsShaders(
             layer_source_program = &programs[index];
         }
     }
+
+#ifdef _WIN32
+    // AMD's Windows driver can crash when a geometry shader exports all generic locations.
+    if (device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY && !key.xfb_enabled) {
+        constexpr size_t geometry_index = static_cast<size_t>(Maxwell::ShaderType::Geometry);
+        constexpr size_t fragment_index = static_cast<size_t>(Maxwell::ShaderType::Pixel);
+        if (key.unique_hashes[geometry_index] != 0 &&
+            key.unique_hashes[fragment_index] != 0) {
+            auto& geometry = programs[geometry_index];
+            const auto& fragment = programs[fragment_index];
+            size_t generic_outputs{};
+            for (size_t index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+                generic_outputs += geometry.info.stores.Generic(index) ? 1 : 0;
+            }
+            if (generic_outputs == Shader::IR::NUM_GENERICS &&
+                !geometry.info.stores.Legacy() && !fragment.info.loads.Legacy()) {
+                for (size_t index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+                    if (fragment.info.loads.Generic(index)) {
+                        continue;
+                    }
+                    for (size_t component = 0; component < 4; ++component) {
+                        geometry.info.stores.Set(Shader::IR::Attribute::Generic0X + index * 4 +
+                                                     component,
+                                                 false);
+                    }
+                }
+            }
+        }
+    }
+#endif
+
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     auto modules{std::make_shared<GraphicsShaderModules>()};
 

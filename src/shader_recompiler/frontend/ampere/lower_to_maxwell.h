@@ -4,7 +4,6 @@
 // Encoding reference: Mesa NAK sm70_encode.rs (MIT), Copyright 2022 Collabora, Ltd.
 #pragma once
 
-#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -43,7 +42,8 @@ struct LoweredProgram {
 // Lower only operations whose semantics are representable by the existing
 // Maxwell frontend. These are new instructions, not reinterpretations of the
 // native bytes. Scheduling/control words are added by the environment adapter.
-inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
+inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+                                     std::string_view tensor_mode = {}) {
     LoweredProgram result;
     struct Relocation { u32 output_index; s64 target; };
     std::vector<Relocation> relocations;
@@ -1126,16 +1126,18 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             // Lane t (group g = t/4, i = t%4): A regs hold rows g / g+8 at k 2i..2i+1 (a0, a1) and
             // 8+2i.. (a2, a3); B regs hold k 2i.. (b0) / 8+2i.. (b1) of column g; D holds rows
             // g / g+8 at columns 2i, 2i+1. Rebuilt from shuffles with HFMA2, accumulating in R252/R253.
-            // The expansion is correct but large: title 4's 372-HMMA network takes the host driver
-            // minutes to compile, so it stays opt-in (the QMD still completes when rejected).
-            // EDEN_NX2_TENSOR=stub keeps the rest of the program but makes every HMMA D = C.
-            static const char* const mode = std::getenv("EDEN_NX2_TENSOR");
-            if (!mode) return fail(index, "native matrix multiply (set EDEN_NX2_TENSOR to emulate)");
+            // The expansion is correct but large: title 4's 372-HMMA network is kept compact here
+            // because host-driver compilation cost grows sharply with the emitted instruction count.
+            // Full emulation is required for this title's upscaler. Keep the diagnostic stub
+            // available explicitly, but reject HMMA unless the backend opts in.
+            if (tensor_mode.empty()) {
+                return fail(index, "native matrix multiply requires EDEN_NX2_TENSOR=full");
+            }
             const u32 a = insn.Bits(24, 8), b = insn.Bits(32, 8), c = insn.Bits(64, 8);
             if ((insn.words[1] & ~0xffU) || (insn.words[2] & ~0xffU) != 0x800 || dest + 2 > 246 ||
                 a + 4 > 246 || b + 2 > 246 || (c != 255 && c + 2 > 246))
                 return fail(index, "native matrix multiply mode");
-            if (std::string_view{mode} == "stub") {
+            if (tensor_mode == "stub") {
                 for (u32 row = 0; row < 2; ++row) {
                     if (c == 255) mov_imm(static_cast<u32>(dest) + row, 0);
                     else if (c != dest) emit(0x5c98000000000000ULL | predicate | (dest + row) | (u64{15} << 39) | (u64{c + row} << 20));
@@ -2032,6 +2034,25 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             emit(base(0x5800000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) |
                  (u64{insn.Bits(87, 4)} << 39) | (u64{insn.Bits(74, 2)} << 45) |
                  (u64{insn.Bits(76, 4)} << 48) | (u64{1} << 52) | (u64{insn.Bits(80, 1)} << 55));
+            break;
+        }
+        case 0x234: { // HSETP2, packed register sources and independent predicate outputs.
+            const auto a = half_source(0), b = half_source(1);
+            const u32 combine = insn.Bits(69, 2);
+            if (insn.Bits(16, 8) || (insn.words[1] & 0x0fffff00U) ||
+                insn.Bits(64, 5) || combine > 2 || insn.Bits(91, 1) ||
+                a.swizzle == 1 || b.swizzle == 1) {
+                return fail(index, "native packed half predicate mode");
+            }
+            emit(0x5d20000000000000ULL | predicate |
+                 (u64{insn.Bits(81, 3)} << 3) | insn.Bits(84, 3) |
+                 (u64{a.reg} << 8) | (u64{b.reg} << 20) |
+                 (u64{b.swizzle} << 28) | (u64{b.absolute} << 30) |
+                 (u64{b.negate} << 31) | (u64{insn.Bits(76, 4)} << 35) |
+                 (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42) |
+                 (u64{a.negate} << 43) | (u64{a.absolute} << 44) |
+                 (u64{combine} << 45) | (u64{a.swizzle} << 47) |
+                 (u64{insn.Bits(71, 1)} << 49) | (u64{insn.Bits(80, 1)} << 6));
             break;
         }
         case 0x434: { // HSETP2 with an immediate half pair: A swizzle 74-75 (neg 72, abs 73),
