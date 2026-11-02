@@ -358,34 +358,20 @@ public:
         process->GetMemory().ReadBlock(nrr_address, std::addressof(header), sizeof(header));
         size_t hashes_offset = header.GetHashesOffset();
         u32 num_hashes = header.GetNumHashes();
-        if (process->IsSwitch2()) {
-            // Switch 2 NRRs carry 3072-bit keys and signatures: the fields after them (program
-            // id, size, kind, hash list offset and count) sit 0x180 bytes later, the hash list
-            // offset and count at 0x4c0.
-            std::array<u32, 2> fields{};
-            process->GetMemory().ReadBlock(nrr_address + 0x4c0, fields.data(), sizeof(fields));
-            hashes_offset = fields[0];
-            num_hashes = fields[1];
-        }
-        // The hash list lies inside the NRR (read as a Switch 1 header, a Switch 2 one asked for
-        // 51 GB of hashes).
-        R_UNLESS(hashes_offset <= nrr_size &&
-                     num_hashes <= (nrr_size - hashes_offset) / sizeof(Sha256Hash),
-                 RO::ResultInvalidNrr);
-
-        // Switch 2 NRRs (header byte 6 is 1, for example Welcome Tour's /.nrr/tcn_Release.nrr) carry
-        // a longer signature area, so the hash list offset (+0x10) and hash count (+0x14) of the body
-        // start at 0x4b0 instead of 0x330 (real ro module 0x3d68-0x3e24).
-        u64 hashes_offset = header.GetHashesOffset();
-        u64 num_hashes = header.GetNumHashes();
+        // Switch 2 NRRs (header byte 6 is 1, for example Welcome Tour's /.nrr/tcn_Release.nrr)
+        // carry 3072-bit keys and signatures, a longer signature area: the hash list offset
+        // (+0x10) and hash count (+0x14) of the body start at 0x4b0 instead of 0x330 (real ro
+        // module 0x3d68-0x3e24), i.e. offset and count at 0x4c0.
         u8 layout[8]{};
         process->GetMemory().ReadBlock(nrr_address, layout, sizeof(layout));
-        if (layout[6] == 1) {
+        if (process->IsSwitch2() || layout[6] == 1) {
             constexpr u64 LongBodyOffset = 0x4b0;
             R_UNLESS(nrr_size >= LongBodyOffset + 0x20, RO::ResultInvalidNrr);
             hashes_offset = process->GetMemory().Read32(nrr_address + LongBodyOffset + 0x10);
             num_hashes = process->GetMemory().Read32(nrr_address + LongBodyOffset + 0x14);
         }
+        // The hash list lies inside the NRR (read as a Switch 1 header, a Switch 2 one asked for
+        // 51 GB of hashes).
         R_UNLESS(hashes_offset <= nrr_size &&
                      num_hashes <= (nrr_size - hashes_offset) / sizeof(Sha256Hash),
                  RO::ResultInvalidNrr);
