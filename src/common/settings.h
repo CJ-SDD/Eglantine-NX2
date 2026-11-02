@@ -603,6 +603,15 @@ struct Values {
     SwitchableSetting<bool> use_video_framerate{linkage, false, "use_video_framerate",
                                                 Category::RendererAdvanced};
 
+    // Mario Kart World: keep the game in its own 30 fps mode (loader/nso.cpp).
+    SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};
+    // Mario Kart World: the game's own dynamic frame rate, timed on the whole frame (nso.cpp),
+    // with presents paced to every vblank (nx2_gsv.h). Takes precedence over mkw_30fps.
+    SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
+                                            Category::RendererAdvanced};
+    // Experimental: let the game run two frames ahead of the GPU thread at 30 fps (nx2_gsv.h).
+    SwitchableSetting<bool> mkw_smooth{linkage, false, "mkw_smooth", Category::RendererAdvanced};
+
     SwitchableSetting<bool> use_reactive_flushing{linkage,
 #ifdef __ANDROID__
                                                   false,
