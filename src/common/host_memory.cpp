@@ -148,7 +148,7 @@ public:
         // Allocate backing file map
         backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
         if (!backing_handle) {
-            LOG_CRITICAL(HW_Memory, "Failed to allocate {} MiB of backing memory", backing_size >> 20);
+            LOG_CRITICAL(HW_Memory, "Failed to allocate {} MiB of backing memory, error {}", backing_size >> 20, GetLastError());
             return false;
         }
         // Allocate a virtual memory for the backing file map as placeholder

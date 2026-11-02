@@ -10,7 +10,9 @@
 #include <vector>
 #include <cstdlib>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
+#include <exception>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -142,6 +144,41 @@ static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* exception) {
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+// abort() and std::terminate end the process with a fail-fast that skips the exception filter:
+// with EDEN_NX2_CRASH_DUMP set, print the uncaught exception (if any) and the stack first.
+static void PrintAbortStack(const char* reason) {
+    std::fprintf(stderr, "%s on thread %lu\n", reason, GetCurrentThreadId());
+    void* frames[48];
+    const USHORT count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+    for (USHORT i = 0; i < count; ++i) {
+        PrintCodeAddress("frame", frames[i]);
+    }
+    std::fflush(stderr);
+}
+
+static void InstallAbortReporting() {
+    if (std::getenv("EDEN_NX2_CRASH_DUMP") == nullptr) {
+        return;
+    }
+    std::set_terminate([] {
+        if (const std::exception_ptr current = std::current_exception()) {
+            try {
+                std::rethrow_exception(current);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "Uncaught exception: %s\n", e.what());
+            } catch (...) {
+                std::fprintf(stderr, "Uncaught non-standard exception\n");
+            }
+        }
+        PrintAbortStack("std::terminate");
+        std::_Exit(3);
+    });
+    std::signal(SIGABRT, [](int) {
+        PrintAbortStack("abort()");
+        std::_Exit(3);
+    });
+}
 #endif
 
 static void OnStateChanged(const Network::RoomMember::State& state) {
@@ -249,6 +286,7 @@ struct SdlState {
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(WriteCrashDump);
+    InstallAbortReporting();
 #endif
     Nx2Sampler::StartFromEnvironment();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
