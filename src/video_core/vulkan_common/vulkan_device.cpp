@@ -411,6 +411,16 @@ std::filesystem::path StaticPipelineCacheFilename() {
     return shader_dir / "vulkan_static_pipelines.bin";
 }
 
+// What a heap's allocations use. The driver also counts the space in VMA's blocks no allocation
+// uses, but freeing an image gives its share back only once its whole block is empty: the caches,
+// collecting until the usage dropped, evicted thousands of textures in a row without lowering it
+// (title 1).
+u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
+    const VmaStatistics& statistics = vma_budget.statistics;
+    const u64 unused = statistics.blockBytes - statistics.allocationBytes;
+    return driver_usage - (std::min)(driver_usage, unused);
+}
+
 } // Anonymous namespace
 
 void Device::RemoveExtension(bool& extension, const std::string& extension_name) {
@@ -779,10 +789,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             .flags = flags,
             .physicalDevice = physical,
             .device = *logical,
-            // 64 MiB blocks on discrete GPUs too: with 256 MiB ones, Switch 2 titles' mix of
+            // 16 MiB blocks on discrete GPUs too: with 256 MiB ones, Switch 2 titles' mix of
             // texture sizes left ~38% of the image blocks empty (2 GB of an 8 GB card in title
-            // 1), which the texture cache counted as used and kept evicting textures for.
-            .preferredLargeHeapBlockSize = 64u * 1024u * 1024u,
+            // 1), which the texture cache counted as used and kept evicting textures for. With
+            // 64 MiB ones textures created and deleted by the thousand still left ~1.7 GB of holes
+            // after ten minutes, with 32 MiB ones ~0.5 GB: a block drains only once all of its
+            // images are gone, and fewer per block drain sooner. VMA gives allocations over half a
+            // block (8 MiB) their own memory, which goes back to the driver when they are freed.
+            .preferredLargeHeapBlockSize = 16u * 1024u * 1024u,
             .pAllocationCallbacks = nullptr,
             .pDeviceMemoryCallbacks = nullptr,
             .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,
@@ -804,7 +818,35 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 Device::~Device() {
     SaveStaticPipelineCache();
     ShutdownGPULogging();
+    for (auto& pools : separate_pools) {
+        for (VmaPool pool : pools) {
+            if (pool != VK_NULL_HANDLE) {
+                vmaDestroyPool(allocator, pool);
+            }
+        }
+    }
     vmaDestroyAllocator(allocator);
+}
+
+VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
+    std::scoped_lock lk{separate_pools_mutex};
+    VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
+    if (pool == VK_NULL_HANDLE) {
+        const VmaPoolCreateInfo ci{
+            .memoryTypeIndex = memory_type,
+            .flags = 0,
+            .blockSize = SeparatePoolBlockSize,
+            .minBlockCount = 0,
+            .maxBlockCount = 0,
+            .priority = 0.f,
+            .minAllocationAlignment = 0,
+            .pMemoryAllocateNext = nullptr,
+        };
+        if (vmaCreatePool(allocator, &ci, &pool) != VK_SUCCESS) {
+            pool = VK_NULL_HANDLE;
+        }
+    }
+    return pool;
 }
 
 void Device::LoadStaticPipelineCache() {
@@ -1515,6 +1557,15 @@ void Device::RemoveUnsuitableExtensions() {
                                VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     }
 
+    // VK_EXT_mesh_shader: Switch 2 titles draw some geometry with task and mesh programs. Only
+    // the two stages are used; the multiview, shading rate and query features need more.
+    features.mesh_shader.multiviewMeshShader = VK_FALSE;
+    features.mesh_shader.primitiveFragmentShadingRateMeshShader = VK_FALSE;
+    features.mesh_shader.meshShaderQueries = VK_FALSE;
+    extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader;
+    RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
+                                       VK_EXT_MESH_SHADER_EXTENSION_NAME);
+
     // VK_KHR_shader_quad_control
     extensions.shader_quad_control = features.shader_quad_control.shaderQuadControl;
     RemoveExtensionFeatureIfUnsuitable(extensions.shader_quad_control, features.shader_quad_control,
@@ -1629,28 +1680,28 @@ void Device::ReleaseCustomBorderColorSamplers(size_t count) const {
 }
 
 u64 Device::GetDeviceMemoryUsage() const {
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
-    budget.pNext = nullptr;
     physical.GetMemoryProperties(&budget);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+    if (allocator != nullptr) {
+        vmaGetHeapBudgets(allocator, heap_budgets.data());
+    }
     u64 result{};
     for (const size_t heap : valid_heap_memory) {
-        result += budget.heapUsage[heap];
-    }
-    // Space in VMA's blocks that no allocation uses counts as used, but freeing an image gives
-    // its share back only once its whole block is empty: the caches, collecting until this drops,
-    // evicted thousands of textures in a row without lowering it (title 1). Count only what
-    // allocations use.
-    if (allocator != nullptr) {
-        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
-        vmaGetHeapBudgets(allocator, heap_budgets.data());
-        for (const size_t heap : valid_heap_memory) {
-            const VmaStatistics& statistics = heap_budgets[heap].statistics;
-            const u64 unused = statistics.blockBytes - statistics.allocationBytes;
-            result -= (std::min)(result, unused);
-        }
+        result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
     }
     return result;
+}
+
+u64 Device::GetDeviceMemorySlack() const {
+    if (allocator == nullptr) {
+        return 0;
+    }
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+    vmaGetHeapBudgets(allocator, heap_budgets.data());
+    const VmaStatistics& statistics = heap_budgets[main_heap].statistics;
+    return statistics.blockBytes - (std::min)(statistics.blockBytes, statistics.allocationBytes);
 }
 
 u64 Device::GetDeviceMemoryBudget() const {
@@ -1666,17 +1717,23 @@ u64 Device::GetDeviceMemoryBudget() const {
     }
     // Only the main heap's budget: summing every heap's counted VRAM twice on AMD (an 8 GB card
     // reported 8.5 GB) and kept the collector's thresholds above the heap the images fill. What
-    // the other heaps use is added, as GetDeviceMemoryUsage() counts it too.
+    // the other heaps use is added the way GetDeviceMemoryUsage() counts it, so the usage reaches
+    // this when the main heap's does its budget.
     u64 result = budget.heapBudget[main_heap];
     if (heap_size_limit != 0) {
         result = (std::min)(result, heap_size_limit);
     }
     for (const size_t heap : valid_heap_memory) {
         if (heap != main_heap) {
-            const VmaStatistics& statistics = heap_budgets[heap].statistics;
-            const u64 unused = statistics.blockBytes - statistics.allocationBytes;
-            result += budget.heapUsage[heap] - (std::min)(budget.heapUsage[heap], unused);
+            result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
         }
+    }
+    if (is_integrated) {
+        // An integrated GPU's device-local heap is system memory (a Radeon 780M reported a 21 GB
+        // budget): following it let the texture cache fill that much RAM before collecting, and
+        // kept ASTC uncompressed. Its budget is at most the share CollectPhysicalMemoryInfo
+        // gives it (4 GiB, 6 GiB with aggressive VRAM use).
+        result = (std::min)(result, device_access_memory);
     }
     return result;
 }
@@ -1695,8 +1752,13 @@ void Device::CollectPhysicalMemoryInfo() {
     // EDEN_NX2_VRAM_LIMIT_MIB=<n>: treat every device-local heap as n MiB (small card tests).
     if (const char* value = std::getenv("EDEN_NX2_VRAM_LIMIT_MIB")) {
         heap_size_limit = std::strtoull(value, nullptr, 10) << 20;
-        LOG_INFO(Render_Vulkan, "EDEN_NX2_VRAM_LIMIT_MIB: device-local heaps limited to {} MiB",
-                 heap_size_limit >> 20);
+        if (heap_size_limit != 0) {
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_VRAM_LIMIT_MIB: device-local heaps limited to {} MiB",
+                     heap_size_limit >> 20);
+        } else {
+            LOG_WARNING(Render_Vulkan, "EDEN_NX2_VRAM_LIMIT_MIB={} is not a size in MiB, ignored",
+                        value);
+        }
     }
     const auto limit = [this](u64 size) {
         return heap_size_limit != 0 ? (std::min)(size, heap_size_limit) : size;

@@ -24,6 +24,7 @@ add_library(shader_recompiler STATIC
     backend/spirv/emit_spirv_memory.cpp
     backend/spirv/emit_spirv_select.cpp
     backend/spirv/emit_spirv_shared_memory.cpp
+    backend/spirv/emit_spirv_mesh.cpp
     backend/spirv/emit_spirv_special.cpp
     backend/spirv/emit_spirv_undefined.cpp
     backend/spirv/emit_spirv_warp.cpp
@@ -184,6 +185,7 @@ add_library(shader_recompiler STATIC
     ir_opt/lower_fp64_to_fp32.cpp
     ir_opt/lower_int64_to_int32.cpp
     ir_opt/passes.h
+    ir_opt/predicate_mask.h
     ir_opt/position_pass.cpp
     ir_opt/rescaling_pass.cpp
     ir_opt/ssa_rewrite_pass.cpp

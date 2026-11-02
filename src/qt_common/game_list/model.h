@@ -51,6 +51,7 @@ public:
 
     void PopulateAsync(QVector<UISettings::GameDir>& game_dirs);
     void WorkerEvent();
+    void SetScanEnabled(bool enabled);
 
     bool IsEmpty() const;
 
@@ -78,8 +79,10 @@ private:
     void AddFavorite(u64 program_id);
     void RemoveFavorite(u64 program_id);
     void Repopulate();
+    void StopWorker();
 
     bool m_flat = false;
+    bool scan_enabled = true;
 
     std::shared_ptr<FileSys::VfsFilesystem> vfs;
     FileSys::ManualContentProvider* provider;

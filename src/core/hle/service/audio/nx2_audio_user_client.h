@@ -14,8 +14,9 @@ namespace Service::Audio {
 // Switch 2 "aud:u" (nn::audio::CreateUserClientSessionByHipc). The SDK reaches the Switch 1
 // audio interfaces through it: command 2 returns an object used exactly like
 // IAudioRendererManager (vtable slot 1 = GetWorkBufferSize with a Switch 1 parameter block), so
-// it is backed by Eden's audren:u implementation. The nx2: name keeps unknown commands
-// auto-stubbed and logged.
+// it is backed by Eden's audren:u implementation. Command 1 is nn::audio::OpenAudioOut's
+// manager, called like IAudioOutManager (slot 1 = OpenAudioOut), backed by audout:u. The nx2: name
+// keeps unknown commands auto-stubbed and logged.
 class INx2AudioUserClient final : public ServiceFramework<INx2AudioUserClient> {
 public:
     explicit INx2AudioUserClient(Core::System& system_)

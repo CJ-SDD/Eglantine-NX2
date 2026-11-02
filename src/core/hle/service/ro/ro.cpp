@@ -356,6 +356,22 @@ public:
         // Read NRR.
         NrrHeader header{};
         process->GetMemory().ReadBlock(nrr_address, std::addressof(header), sizeof(header));
+        size_t hashes_offset = header.GetHashesOffset();
+        u32 num_hashes = header.GetNumHashes();
+        if (process->IsSwitch2()) {
+            // Switch 2 NRRs carry 3072-bit keys and signatures: the fields after them (program
+            // id, size, kind, hash list offset and count) sit 0x180 bytes later, the hash list
+            // offset and count at 0x4c0.
+            std::array<u32, 2> fields{};
+            process->GetMemory().ReadBlock(nrr_address + 0x4c0, fields.data(), sizeof(fields));
+            hashes_offset = fields[0];
+            num_hashes = fields[1];
+        }
+        // The hash list lies inside the NRR (read as a Switch 1 header, a Switch 2 one asked for
+        // 51 GB of hashes).
+        R_UNLESS(hashes_offset <= nrr_size &&
+                     num_hashes <= (nrr_size - hashes_offset) / sizeof(Sha256Hash),
+                 RO::ResultInvalidNrr);
 
         // Switch 2 NRRs (header byte 6 is 1, for example Welcome Tour's /.nrr/tcn_Release.nrr) carry
         // a longer signature area, so the hash list offset (+0x10) and hash count (+0x14) of the body

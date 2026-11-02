@@ -219,6 +219,7 @@ add_executable(yuzu
     yuzu.qrc
     yuzu.rc
     migration_dialog.h migration_dialog.cpp
+    nup_dialogs.h nup_dialogs.cpp
     migration_worker.h migration_worker.cpp
     libqt_common.h libqt_common.cpp
 
@@ -365,6 +366,8 @@ target_sources(yuzu
 
 # TODO(crueter): Move Assets.car/icon/icns handling to its own Module.
 if (APPLE)
+    target_sources(yuzu PRIVATE util/macos_sleep.cpp util/macos_sleep.h)
+
     # Xcode will automatically generate the Assets.car and icns file for us.
     set(_dist "${CMAKE_SOURCE_DIR}/dist")
     if (CMAKE_GENERATOR MATCHES "Xcode")

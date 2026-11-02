@@ -246,7 +246,7 @@ FormatInfo SurfaceFormat(const Device& device, FormatType format_type, bool with
     bool const is_srgb = with_srgb && VideoCore::Surface::IsPixelFormatSRGB(pixel_format);
     // Transcode on hardware that doesn't support ASTC natively
     if (!device.IsOptimalAstcSupported() && VideoCore::Surface::IsPixelFormatASTC(pixel_format)) {
-        switch (Settings::values.astc_recompression.GetValue()) {
+        switch (Settings::GetAstcRecompression()) {
         case Settings::AstcRecompression::Uncompressed:
             if (is_srgb) {
                 tuple.format = VK_FORMAT_A8B8G8R8_SRGB_PACK32;
@@ -333,6 +333,10 @@ VkShaderStageFlagBits ShaderStage(Shader::Stage stage) {
         return VK_SHADER_STAGE_FRAGMENT_BIT;
     case Shader::Stage::Compute:
         return VK_SHADER_STAGE_COMPUTE_BIT;
+    case Shader::Stage::Task:
+        return VK_SHADER_STAGE_TASK_BIT_EXT;
+    case Shader::Stage::Mesh:
+        return VK_SHADER_STAGE_MESH_BIT_EXT;
     }
     UNIMPLEMENTED_MSG("Unimplemented shader stage={}", stage);
     return {};

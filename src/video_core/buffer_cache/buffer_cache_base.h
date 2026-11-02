@@ -14,7 +14,9 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <span>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -248,6 +250,12 @@ public:
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
 
+    /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
+    /// data reaches guest memory, so reads must ask the buffer cache (GetFlushArea).
+    bool FlushesOnCpuRead() const {
+        return !AsyncBufferDownloads();
+    }
+
     bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer);
 
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size);
@@ -317,6 +325,28 @@ public:
     bool DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount);
 
     bool DMAClear(GPUVAddr src_address, u64 amount, u32 value);
+
+    /// Switch 2 GPU-written command lists (nx2.h, g_nx2_command_list_pages). While collecting (a
+    /// compute dispatch or a DMA copy being recorded), writes to command list pages are noted;
+    /// Nx2CopyListPages then records copies of those pages into host memory after the work.
+    void Nx2CollectListCopies(bool collect) {
+        nx2_collect_list_copies = collect;
+        if (!collect) {
+            nx2_list_copy_requests.clear();
+        }
+    }
+    /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
+    bool Nx2CopyListPages(u64 tick);
+    enum class Nx2ListRead { Unknown, Copied, Synced };
+    /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
+    /// written by no GPU work since), else Copied with `out` filled from the copy of its last
+    /// write once the GPU is done with it. Unknown otherwise: the caller drains and flushes.
+    Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out);
+    /// Front thread, the split drained: the command list page was flushed to guest memory.
+    void Nx2NoteListSynced(DAddr page);
+    /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
+    /// no longer holds the page.
+    void Nx2NoteListHostWrite(DAddr device_addr, u64 size);
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
@@ -443,6 +473,10 @@ private:
 
     void MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync = false);
 
+    /// Counts a GPU write to the command list pages in the range (invalidating their copies) and,
+    /// while collecting, asks for new copies.
+    void Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64 size);
+
     [[nodiscard]] BufferId FindBuffer(DAddr device_addr, u32 size, bool sparse_compatible);
 
     void SynchronizeBufferWrites(Buffer& buffer);
@@ -547,6 +581,31 @@ private:
         return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling() ||
                Tegra::Nx2NeedsBufferDownloads();
     }
+
+    /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
+    /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
+    /// flush and rely on these downloads, e.g. collision meshes skinned by compute shaders.
+    bool DownloadsAtFence(DAddr device_addr, u64 size) noexcept {
+        return AsyncBufferDownloads() || memory_tracker.IsRegionPreflushable(device_addr, size);
+    }
+
+    /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
+    /// pages, which flushes them once and marks them Preflushable (then DownloadsAtFence).
+    void ArmReadTraps(DAddr device_addr, u64 size) {
+        const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+        const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
+        u64 armed_bytes = 0;
+        read_trapped_ranges.ForEachInRange(begin, end - begin, [&](DAddr lower, DAddr upper) {
+            armed_bytes += upper - lower;
+        });
+        if (armed_bytes == end - begin) {
+            return;
+        }
+        read_trapped_ranges.Add(begin, end - begin);
+        device_memory.ArmReadTraps(begin, end - begin);
+    }
+
+    Common::RangeSet<DAddr> read_trapped_ranges;
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
     /// Buffer pages the guest CPU reads (NoteCpuRead). Without AsyncBufferDownloads, GPU writes
@@ -556,17 +615,20 @@ private:
     /// 8 MiB window) dropped it from 60 to about 42 frames a second.
     Common::RangeSet<DAddr> cpu_read_ranges;
 
-    /// Queues the parts of a GPU write to [addr, addr + size) that are copied back at the next
-    /// fence.
+    /// Queues a GPU write to [addr, addr + size): copied back at the next fence when downloads are
+    /// on or the range was read by the guest CPU (Preflushable); else only the parts the CPU is known
+    /// to read (cpu_read_ranges) are, and the rest traps the CPU's next read (ArmReadTraps).
     void QueueDownload(DAddr addr, u64 size) {
-        if (AsyncBufferDownloads()) {
+        if (DownloadsAtFence(addr, size)) {
             uncommitted_gpu_modified_ranges.Add(addr, size);
             return;
         }
         cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr end) {
             uncommitted_gpu_modified_ranges.Add(start, end - start);
         });
+        ArmReadTraps(addr, size);
     }
+
 
     // Async Buffers
     Common::OverlapRangeSet<DAddr> async_downloads;
@@ -578,6 +640,8 @@ private:
 
     size_t immediate_buffer_capacity = 0;
     Common::ScratchBuffer<u8> immediate_buffer_alloc;
+    /// Guest memory large uploads came from since the last cold hint (device address, size).
+    std::vector<std::pair<DAddr, u64>> uploaded_buffer_ranges;
 
     struct LRUItemParams {
         using ObjectType = BufferId;
@@ -600,6 +664,29 @@ private:
     // Covers the device address space (MaxwellDeviceTraits::device_virtual_bits).
     std::array<BufferId, ((1ULL << 36) >> CACHING_PAGEBITS)> page_table;
     Common::ScratchBuffer<u8> tmp_buffer;
+
+    /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
+    using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));
+    struct Nx2ListPage {
+        u64 writes{};      ///< GPU writes noted to the page
+        u64 copy_writes{}; ///< `writes` when the copy was made: the copy is current while equal
+        u64 copy_tick{};   ///< GPU tick that completes the copy
+        /// `writes` when the front last flushed the page: guest memory holds it while equal
+        u64 synced_writes{~u64{0}};
+        u32 copy_begin{};  ///< Bytes of the page the copy holds (a buffer can end inside it)
+        u32 copy_end{};
+        /// Written outside a compute dispatch or a DMA copy (a draw's storage writes) at least
+        /// once: the front can't tell from what it sent whether such a write is still queued, so
+        /// the page's lists always drain the split instead of reading a copy.
+        bool draw_written{};
+        std::optional<Nx2Staging> copy;
+    };
+    std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies
+    std::unordered_map<DAddr, Nx2ListPage> nx2_list_pages;
+    /// Copies replaced while the GPU may still write them: freed once it is past their tick.
+    std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
+    boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;
+    bool nx2_collect_list_copies{};
 };
 
 } // namespace VideoCommon
