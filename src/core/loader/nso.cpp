@@ -243,6 +243,62 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
 
+    // Donkey Kong Bananza has no vblank-mode selector like Mario Kart World. Its frame rate
+    // controller calls nn::vi::SetLayerExtendedSwapInterval(layer, 1, fps) from two sites; forcing
+    // fps = 30 there locks the game to 30. Sites are found by their code (same in base and 458752):
+    //   A: ldr x0,[x19,#0x180]; mov w1,#1; ldr w2,[x19,#0xE0]; bl   (patch the ldr w2)
+    //   B: ldr x0,[x0,#0x180];  mov w1,#1; mov w2,w19;          bl   (patch the mov w2)
+    if (Settings::values.dk_30fps.GetValue() && name == "main" &&
+        process.GetProgramId() == 0x040074A01BF12000ULL) {
+        const auto& text = nso_header.segments[0];
+        u8* const code = codeset.memory.data() + module_start + text.location;
+        const size_t count = text.size / sizeof(u32);
+        const auto word = [code](size_t index) {
+            u32 value;
+            std::memcpy(&value, code + index * sizeof(u32), sizeof(value));
+            return value;
+        };
+        size_t site_a = 0, site_b = 0, matches_a = 0, matches_b = 0;
+        for (size_t i = 0; i + 3 < count; ++i) {
+            if ((word(i + 3) & 0xFC000000) != 0x94000000 || word(i + 1) != 0x52800021) {
+                continue; // bl, mov w1,#1
+            }
+            if (word(i) == 0xF940C260 && word(i + 2) == 0xB940E262) {
+                site_a = i + 2;
+                ++matches_a;
+            } else if (word(i) == 0xF940C000 && word(i + 2) == 0x2A1303E2) {
+                site_b = i + 2;
+                ++matches_b;
+            }
+        }
+        // The controller's own dynamic divisor (vblanks per frame, 1..3) drives the present interval.
+        // Pin it: mov w8,#60; ldr w9,[x20,#0x24]; str w21,[x20,#0x40]; sdiv w8,w8,w21 -> w21=2, w8=30.
+        size_t site_div = 0, matches_div = 0;
+        for (size_t i = 0; i + 4 < count; ++i) {
+            if (word(i) == 0x52800788 && word(i + 1) == 0xB9402689 && word(i + 2) == 0xB9004295 &&
+                word(i + 3) == 0x1AD50D08 && word(i + 4) == 0x2A0803E1) {
+                site_div = i;
+                ++matches_div;
+            }
+        }
+        if (matches_a == 1 && matches_b == 1 && matches_div == 1) {
+            constexpr u32 Mov30 = 0x528003C2;   // mov w2, #30
+            constexpr u32 MovDiv2 = 0x52800055; // mov w21, #2
+            constexpr u32 MovFps30 = 0x528003C8; // mov w8, #30
+            std::memcpy(code + site_a * sizeof(u32), &Mov30, sizeof(Mov30));
+            std::memcpy(code + site_b * sizeof(u32), &Mov30, sizeof(Mov30));
+            std::memcpy(code + site_div * sizeof(u32), &MovDiv2, sizeof(MovDiv2));
+            std::memcpy(code + (site_div + 3) * sizeof(u32), &MovFps30, sizeof(MovFps30));
+            LOG_INFO(Loader,
+                     "Donkey Kong Bananza: 30 FPS lock on (main+{:#x}, main+{:#x}, main+{:#x})",
+                     text.location + site_a * sizeof(u32), text.location + site_b * sizeof(u32),
+                     text.location + site_div * sizeof(u32));
+        } else {
+            LOG_WARNING(Loader, "Donkey Kong Bananza: 30 FPS lock not applied ({}/{}/{} matches)",
+                        matches_a, matches_b, matches_div);
+        }
+    }
+
 #ifdef HAS_NCE
     // If we are computing the process code layout and using nce backend, patch.
     const auto& code = codeset.CodeSegment();

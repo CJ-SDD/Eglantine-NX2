@@ -140,6 +140,9 @@ struct Values {
 
     Setting<bool> check_for_updates{linkage, true, "check_for_updates", Category::UiGeneral};
 
+    // Mario Kart World recommended settings prompt: 0 = ask at every boot, 1 = always use, 2 = never
+    Setting<u8> mkw_recommended_choice{linkage, 0, "mkw_recommended_choice", Category::UiGeneral};
+
     // Linux/MinGW may support (requires libdl support)
     SwitchableSetting<bool> enable_gamemode{linkage,
 #ifndef _MSC_VER

@@ -1853,10 +1853,12 @@ private:
         }();
         // With MKW's dynamic frame rate the game times its own frames to pick 1 or 2 vblanks:
         // holding a frame for 2 would make every frame last 2 and keep it at 30 fps for good, so
-        // pace to each vblank and let the game catch up through its interval.
+        // pace to each vblank and let the game catch up through its interval. Donkey Kong
+        // Bananza's 30 fps lock pins the game to 2 vblanks, so it is paced by its own interval.
         const u32 swap_interval =
             forced_interval != 0 ? forced_interval
-            : Settings::values.mkw_dynamic_fps.GetValue() ? 1U
+            : Settings::values.mkw_dynamic_fps.GetValue() && !Settings::values.dk_30fps.GetValue()
+                ? 1U
                                                           : std::clamp<u32>(timing >> 16, 1, 4);
         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
         if (timing != std::exchange(m_swap_word, timing)) {

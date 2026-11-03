@@ -612,6 +612,9 @@ struct Values {
     // Experimental: let the game run two frames ahead of the GPU thread at 30 fps (nx2_gsv.h).
     SwitchableSetting<bool> mkw_smooth{linkage, false, "mkw_smooth", Category::RendererAdvanced};
 
+    // Donkey Kong Bananza: lock its frame rate controller to 30 fps (loader/nso.cpp).
+    SwitchableSetting<bool> dk_30fps{linkage, false, "dk_30fps", Category::RendererAdvanced};
+
     SwitchableSetting<bool> use_reactive_flushing{linkage,
 #ifdef __ANDROID__
                                                   false,

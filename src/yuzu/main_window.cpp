@@ -459,29 +459,6 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     // Gen keys if necessary
     OnCheckFirmwareDecryption(false);
 
-    auto* recommendations = new QMessageBox(
-        QMessageBox::Question, tr("Recommended Mario Kart World settings"),
-        tr("Use the recommended settings for Mario Kart World?\n\n"
-           "Vulkan, 1x resolution, GPU Fast, asynchronous shaders, BC3, conservative VRAM, "
-           "reactive flushing off, FIFO Relaxed VSync, handheld mode, ScaleForce, and FXAA.\n\n"
-           "Yes replaces your saved settings. No or closing this window keeps your settings."),
-        QMessageBox::Yes | QMessageBox::No, this);
-    recommendations->setAttribute(Qt::WA_DeleteOnClose);
-    recommendations->setDefaultButton(QMessageBox::No);
-    recommendations->setEscapeButton(QMessageBox::No);
-    recommendations->setWindowModality(Qt::NonModal);
-    connect(recommendations, &QMessageBox::finished, this, [this](int result) {
-        use_recommended_mkw_settings = result == QMessageBox::Yes;
-        if (use_recommended_mkw_settings && !emulation_running && !boot_in_progress) {
-            Settings::SetMarioKartWorldRecommendedSettings(Settings::values, true);
-            config->SaveAllValues();
-            QtCommon::system->ApplySettings();
-            UpdateStatusButtons();
-        }
-        LOG_INFO(Config, "MKW recommended settings accepted: {}", use_recommended_mkw_settings);
-    });
-    recommendations->show();
-
 #ifdef __unix__
     OnCheckGraphicsBackend();
 #endif
@@ -1989,6 +1966,33 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         QtCommon::system->ApplySettings();
     }
 
+    if (title_id == Settings::MarioKartWorldProgramId) {
+        auto& choice = UISettings::values.mkw_recommended_choice;
+        if (choice.GetValue() == 0) {
+            QMessageBox box(
+                QMessageBox::Question, tr("Recommended Mario Kart World settings"),
+                tr("Use the recommended settings for Mario Kart World?\n\n"
+                   "Vulkan, 1x resolution, GPU Fast, asynchronous shaders, BC3, conservative "
+                   "VRAM, reactive flushing off, FIFO Relaxed VSync, handheld mode, ScaleForce, "
+                   "and FXAA.\n\n"
+                   "Yes overrides your settings for this game only. No keeps them."),
+                QMessageBox::Yes | QMessageBox::No, this);
+            box.setDefaultButton(QMessageBox::No);
+            box.setEscapeButton(QMessageBox::No);
+            auto* remember = new QCheckBox(tr("Don't ask again"), &box);
+            box.setCheckBox(remember);
+            const bool yes = box.exec() == QMessageBox::Yes;
+            use_recommended_mkw_settings = yes;
+            if (remember->isChecked()) {
+                choice.SetValue(yes ? 1 : 2);
+                config->SaveAllValues();
+            }
+        } else {
+            use_recommended_mkw_settings = choice.GetValue() == 1;
+        }
+    } else {
+        use_recommended_mkw_settings = false;
+    }
     if (Settings::ApplyMarioKartWorldPreset(Settings::values, title_id,
                                           use_recommended_mkw_settings)) {
         QtCommon::system->ApplySettings();

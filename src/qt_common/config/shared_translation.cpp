@@ -286,6 +286,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("With the 30 FPS mode, lets the game prepare one more frame ahead, which removes "
               "most drops to 20 fps. Adds about 33 ms of input delay. Experimental: if the game "
               "freezes, turn it off."));
+    INSERT(Settings, dk_30fps, tr("Donkey Kong Bananza: 30 FPS lock (experimental)"),
+           tr("Forces the game's frame rate controller to 30 fps, for a steady rate when 60 "
+              "can't be held.\nTakes effect at the next game launch."));
     INSERT(Settings, barrier_feedback_loops, tr("Barrier feedback loops"),
            tr("Improves rendering of transparency effects in specific games."));
     INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),
