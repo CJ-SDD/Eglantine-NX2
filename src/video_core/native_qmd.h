@@ -81,7 +81,7 @@ public:
             // Validate the release slots before making any visible.
             for (const Word base : ReleaseSlots) {
                 const Word flags = qmd[base + 1];
-                if (!(flags & (1U << 23))) continue;
+                if (!(flags & (1U << 23)) || IsUnpatchedSlot(base, flags)) continue;
                 const bool add = (flags & (1U << 26)) != 0;
                 if ((flags & (0x3bU << 24)) || (flags >> 30) != 1 ||
                     (add && (flags & (7U << 20)))) return "unsupported QMD release format";
@@ -98,7 +98,7 @@ public:
             state.completed = true;
             for (const Word base : ReleaseSlots) {
                 const Word flags = qmd[base + 1];
-                if (!(flags & (1U << 23))) continue;
+                if (!(flags & (1U << 23)) || IsUnpatchedSlot(base, flags)) continue;
                 const Address destination = (Address{flags & 0xff} << 32) | qmd[base];
                 bool released{};
                 if constexpr (std::is_invocable_r_v<bool, Release, Address, Word, Word>) {
@@ -122,6 +122,13 @@ private:
     // Release slots (address low, flags | address high, payload). NVN2 patches a third one at
     // word 52 for queue syncs (e.g. a compute queue releasing a semaphore another queue waits on).
     static constexpr std::array<Word, 3> ReleaseSlots{24, 28, 52};
+
+    // Orbitals (UE5) launches QMDs whose word 52 slot is enabled but was never patched: structure
+    // size field 0 and payload 0 (e.g. flags 0x0080001b). Rejecting the QMD for it dropped the
+    // valid slot 24 release the other channels wait on, so such a slot is skipped instead.
+    static bool IsUnpatchedSlot(Word base, Word flags) {
+        return base == 52 && (flags >> 30) == 0 && !(flags & (1U << 26)) && !(flags & (1U << 19));
+    }
 
     struct State {
         Descriptor descriptor{};

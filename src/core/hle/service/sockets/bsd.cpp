@@ -5,7 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <chrono>
 #include <memory>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -610,7 +612,16 @@ std::pair<s32, Errno> BSD_USA::PollImpl(std::vector<u8>& write_buffer, std::span
         return {-1, Errno::INVAL};
     }
 
-    for (PollFD& pollfd : fds) {
+    // Descriptors without a host socket (EventFd is a stub and hands out fd 0) never become
+    // ready. They used to end the poll at once with no events, whatever the timeout, and the
+    // guest's network thread then polled ~15,000 times a second (Orbitals). Poll the real
+    // sockets instead and wait out the timeout, capped so a wake-up the guest sends through
+    // such a descriptor is late by at most UnbackedPollTimeoutMs.
+    constexpr s32 UnbackedPollTimeoutMs = 20;
+    std::vector<size_t> backed;
+    backed.reserve(fds.size());
+    for (size_t i = 0; i < fds.size(); ++i) {
+        PollFD& pollfd = fds[i];
         ASSERT(False(pollfd.revents));
 
         if (pollfd.fd > static_cast<s32>(MAX_FD) || pollfd.fd < 0) {
@@ -619,28 +630,39 @@ std::pair<s32, Errno> BSD_USA::PollImpl(std::vector<u8>& write_buffer, std::span
             return {0, Errno::SUCCESS};
         }
 
-        const std::optional<FileDescriptor>& descriptor = file_descriptors[pollfd.fd];
-        if (!descriptor) {
+        if (!file_descriptors[pollfd.fd]) {
             LOG_TRACE(Service, "File descriptor handle={} is not allocated", pollfd.fd);
-            pollfd.revents = PollEvents::Nval;
-            return {0, Errno::SUCCESS};
+            pollfd.revents = PollEvents{};
+            continue;
         }
+        backed.push_back(i);
     }
 
-    std::vector<Network::PollFD> host_pollfds(fds.size());
-    std::transform(fds.begin(), fds.end(), host_pollfds.begin(), [](PollFD pollfd) {
+    const bool has_unbacked = backed.size() != fds.size();
+    const s32 wait_ms = has_unbacked && (timeout < 0 || timeout > UnbackedPollTimeoutMs)
+                            ? UnbackedPollTimeoutMs
+                            : timeout;
+    if (backed.empty()) {
+        if (wait_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{wait_ms});
+        }
+        std::memcpy(write_buffer.data(), fds.data(), nfds * sizeof(PollFD));
+        return {0, Errno::SUCCESS};
+    }
+
+    std::vector<Network::PollFD> host_pollfds(backed.size());
+    std::transform(backed.begin(), backed.end(), host_pollfds.begin(), [&fds](size_t index) {
         Network::PollFD result;
-        result.socket = file_descriptors[pollfd.fd]->socket.get();
-        result.events = Translate(pollfd.events);
+        result.socket = file_descriptors[fds[index].fd]->socket.get();
+        result.events = Translate(fds[index].events);
         result.revents = Network::PollEvents{};
         return result;
     });
 
-    const auto result = Network::Poll(host_pollfds, timeout);
+    const auto result = Network::Poll(host_pollfds, wait_ms);
 
-    const size_t num = host_pollfds.size();
-    for (size_t i = 0; i < num; ++i) {
-        fds[i].revents = Translate(host_pollfds[i].revents);
+    for (size_t i = 0; i < backed.size(); ++i) {
+        fds[backed[i]].revents = Translate(host_pollfds[i].revents);
     }
     std::memcpy(write_buffer.data(), fds.data(), nfds * sizeof(PollFD));
 

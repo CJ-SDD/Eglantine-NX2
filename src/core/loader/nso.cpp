@@ -5,9 +5,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "common/common_funcs.h"
@@ -45,6 +49,56 @@ static_assert(sizeof(MODHeader) == 0x1c, "MODHeader has incorrect size.");
 
 constexpr u32 PageAlignSize(u32 size) {
     return static_cast<u32>((size + Core::Memory::YUZU_PAGEMASK) & ~Core::Memory::YUZU_PAGEMASK);
+}
+
+// Module offset of an exported symbol, read from the image's MOD0 dynamic section. The symbol
+// table directly precedes the string table in SDK modules.
+std::optional<size_t> FindExportedSymbol(std::span<const u8> image, std::string_view symbol) {
+    const auto read = [image]<typename T>(size_t offset, T& value) {
+        if (offset + sizeof(T) > image.size()) {
+            return false;
+        }
+        std::memcpy(&value, image.data() + offset, sizeof(T));
+        return true;
+    };
+    u32 mod_offset = 0;
+    MODHeader mod{};
+    if (!read(4, mod_offset) || !read(mod_offset, mod) ||
+        mod.magic != Common::MakeMagic('M', 'O', 'D', '0')) {
+        return std::nullopt;
+    }
+    u64 strtab = 0, symtab = 0;
+    for (size_t entry = mod_offset + static_cast<s32>(mod.dynamic_offset);; entry += 16) {
+        s64 tag = 0;
+        u64 value = 0;
+        if (!read(entry, tag) || !read(entry + 8, value) || tag == 0) {
+            break;
+        }
+        if (tag == 5 && strtab == 0) { // DT_STRTAB
+            strtab = value;
+        } else if (tag == 6 && symtab == 0) { // DT_SYMTAB
+            symtab = value;
+        }
+    }
+    if (strtab == 0 || symtab == 0 || strtab >= image.size()) {
+        return std::nullopt;
+    }
+    for (u64 entry = symtab + 24; entry + 24 <= strtab; entry += 24) {
+        u32 name = 0;
+        u16 section = 0;
+        u64 value = 0;
+        read(entry, name);
+        read(entry + 6, section);
+        read(entry + 8, value);
+        if (value == 0 || section == 0 || strtab + name + symbol.size() >= image.size()) {
+            continue;
+        }
+        const char* const text = reinterpret_cast<const char*>(image.data() + strtab + name);
+        if (std::string_view{text, symbol.size()} == symbol && text[symbol.size()] == '\0') {
+            return value;
+        }
+    }
+    return std::nullopt;
 }
 } // Anonymous namespace
 
@@ -296,6 +350,77 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         } else {
             LOG_WARNING(Loader, "Donkey Kong Bananza: 30 FPS lock not applied ({}/{}/{} matches)",
                         matches_a, matches_b, matches_div);
+        }
+    }
+
+    // Metroid Prime 4 Beyond ships one Switch 1 program for both editions: nnMain stores
+    // nn::pl::IsRunningOnOunce() in a global that selects the Switch 2 Edition. The SDK's version
+    // only returns false (mov w0, wzr; ret); a Switch 2 with the edition's unlock content reports
+    // true. EDEN_NX2_OUNCE=0/1 overrides the setting.
+    if (load_into_process && name == "sdk" && process.GetProgramId() == 0x010019A01E2F2000ULL) {
+        bool ounce = Settings::values.mp4_switch2_edition.GetValue();
+        if (const char* env = std::getenv("EDEN_NX2_OUNCE"); env && *env) {
+            ounce = *env != '0';
+        }
+        const std::span<u8> image(codeset.memory.data() + module_start,
+                                  codeset.memory.size() - module_start);
+        const auto symbol = FindExportedSymbol(image, "_ZN2nn2pl16IsRunningOnOunceEv");
+        if (ounce && symbol && *symbol + 8 <= nso_header.segments[0].size) {
+            constexpr std::array<u32, 2> ReturnTrue{0x52800020, 0xD65F03C0}; // mov w0, #1; ret
+            std::memcpy(image.data() + *symbol, ReturnTrue.data(), sizeof(ReturnTrue));
+            LOG_INFO(Loader, "Metroid Prime 4: Switch 2 Edition mode on (sdk+{:#x})", *symbol);
+        } else if (ounce) {
+            LOG_WARNING(Loader, "Metroid Prime 4: nn::pl::IsRunningOnOunce not found in sdk");
+        } else {
+            LOG_INFO(Loader, "Metroid Prime 4: Switch 1 version (Switch 2 Edition mode off)");
+        }
+    }
+
+    // Metroid Prime 4's rumble mixer keeps its vibration sources in sync with displayed frames: a
+    // source counts as active once the GPU frame queue has completed the frame it started on
+    // (completed [q+0x350] >= stamp taken from submitted [q+0x348]). Each frame the mixer re-pushes
+    // the active sources and pops one, without checking that any was pushed. The console's GPU
+    // finishes a frame within one CPU frame, so the always-present idle source is active by the
+    // second mixer pass; when Eden's GPU runs a frame behind at boot it is not, the pop underflows
+    // the stack (its count is overwritten) and the next pass crashes (main+0x115a34 in 2.0.0, about
+    // one boot in seven). The idle source is the "no vibration" base, so make it always active.
+    // Same code in 1.0.0 (main+0xdd22b4) and 2.0.0 (main+0xdc5c54). EDEN_NX2_MP4_VIBFIX=0 skips it.
+    const char* vibfix_env = std::getenv("EDEN_NX2_MP4_VIBFIX");
+    if (load_into_process && name == "main" && process.GetProgramId() == 0x010019A01E2F2000ULL &&
+        !(vibfix_env && *vibfix_env == '0')) {
+        constexpr std::array<u32, 13> IdleIsActive{
+            0xF9401C08, // ldr x8, [x0, #0x38]       stamp
+            0xB40000A8, // cbz x8, inactive
+            0xF944BC29, // ldr x9, [x1, #0x978]      frame queue
+            0xF941A929, // ldr x9, [x9, #0x350]      completed
+            0xEB08013F, // cmp x9, x8
+            0x54000062, // b.hs active
+            0x2A1F03E0, // mov w0, wzr
+            0xD65F03C0, // ret
+            0x52800020, // mov w0, #1
+            0xD65F03C0, // ret
+            0xF944BC28, // Start: ldr x8, [x1, #0x978]
+            0xF941A508, //        ldr x8, [x8, #0x348]  submitted
+            0xF9001C08, //        str x8, [x0, #0x38]
+        };
+        const auto& text = nso_header.segments[0];
+        u8* const code = codeset.memory.data() + module_start + text.location;
+        size_t found = 0;
+        size_t matches = 0;
+        for (size_t offset = 0; offset + sizeof(IdleIsActive) <= text.size; offset += 4) {
+            if (std::memcmp(code + offset, IdleIsActive.data(), sizeof(IdleIsActive)) == 0) {
+                found = offset;
+                ++matches;
+            }
+        }
+        if (matches == 1) {
+            constexpr std::array<u32, 2> ReturnTrue{0x52800020, 0xD65F03C0}; // mov w0, #1; ret
+            std::memcpy(code + found, ReturnTrue.data(), sizeof(ReturnTrue));
+            LOG_INFO(Loader, "Metroid Prime 4: idle vibration source always active (main+{:#x})",
+                     text.location + found);
+        } else {
+            LOG_WARNING(Loader, "Metroid Prime 4: idle vibration source not patched ({} matches)",
+                        matches);
         }
     }
 

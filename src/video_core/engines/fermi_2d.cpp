@@ -21,6 +21,42 @@ namespace Tegra::Engines {
 
 using namespace Texture;
 
+namespace {
+
+// A 2D engine surface is a 2D slice of a block-linear surface `depth` slices deep: the engine reads
+// or writes slice `layer`. Slices are laid out as in a 3D texture: (layer >> block_depth) whole
+// layers of blocks, then (layer & mask) GOB rows of block_height GOBs inside each block. Rebase the
+// surface onto that slice (the address offset nouveau and NVN use for a 3D slice, with layer 0),
+// so the texture cache finds it as that slice of the 3D image (ImageBase::slice_offsets) and the
+// software blitter reads and writes that one slice. block_depth stays: the slice keeps the
+// 3D block stride. Pitch surfaces have no slices.
+void SelectSurfaceSlice(Fermi2D::Surface& surface) {
+    if (surface.depth == 1 && surface.layer == 0) {
+        return;
+    }
+    const u32 slice = surface.layer;
+    surface.depth = 1;
+    surface.layer = 0;
+    if (surface.linear == Fermi2D::MemoryLayout::Pitch || slice == 0) {
+        return;
+    }
+    const u64 bytes_per_pixel = BytesPerBlock(PixelFormatFromRenderTargetFormat(surface.format));
+    const u32 block_height = surface.block_height;
+    const u32 block_depth = surface.block_depth;
+    const u64 gobs_x = (u64{surface.width} * bytes_per_pixel + GOB_SIZE_X - 1) >> GOB_SIZE_X_SHIFT;
+    const u32 block_lines_shift = GOB_SIZE_Y_SHIFT + block_height;
+    const u64 blocks_y = (u64{surface.height} + (1ULL << block_lines_shift) - 1) >> block_lines_shift;
+    const u64 block_layer_size = (gobs_x * blocks_y) << (GOB_SIZE_SHIFT + block_height + block_depth);
+    const u32 z_mask = (1U << block_depth) - 1;
+    const u64 offset = u64{slice >> block_depth} * block_layer_size +
+                       (u64{slice & z_mask} << (GOB_SIZE_SHIFT + block_height));
+    const GPUVAddr address = surface.Address() + offset;
+    surface.addr_upper = static_cast<u32>(address >> 32);
+    surface.addr_lower = static_cast<u32>(address);
+}
+
+} // Anonymous namespace
+
 Fermi2D::Fermi2D(MemoryManager& memory_manager_) : memory_manager{memory_manager_} {
     sw_blitter = std::make_unique<Blitter::SoftwareBlitEngine>(memory_manager);
     // Nvidia's OpenGL driver seems to assume these values
@@ -84,14 +120,29 @@ void Fermi2D::Blit() {
     LOG_DEBUG(HW_GPU, "called. source address={:#x}, destination address={:#x}", regs.src.Address(), regs.dst.Address());
 
     UNIMPLEMENTED_IF_MSG(regs.operation != Operation::SrcCopy, "Operation is not copy");
-    UNIMPLEMENTED_IF_MSG(regs.src.layer != 0, "Source layer is not zero");
-    UNIMPLEMENTED_IF_MSG(regs.dst.layer != 0, "Destination layer is not zero");
-    UNIMPLEMENTED_IF_MSG(regs.src.depth != 1, "Source depth is not one");
     UNIMPLEMENTED_IF_MSG(regs.clip_enable != 0, "Clipped blit enabled");
 
     const auto& args = regs.pixels_from_memory;
     constexpr s64 null_derivative = 1ULL << 32;
     Surface src = regs.src;
+    Surface dst = regs.dst;
+    // Surfaces with depth != 1 (slices of 3D textures, UE5 on Switch 2): copy slice `layer`.
+    SelectSurfaceSlice(src);
+    SelectSurfaceSlice(dst);
+    if (regs.src.depth != 1 || regs.src.layer != 0 || regs.dst.depth != 1 || regs.dst.layer != 0) {
+        static u32 logged_slices{};
+        if (logged_slices++ < 16) {
+            LOG_INFO(HW_GPU,
+                     "2D blit slice: src {:#x} {}x{}x{} layer {} block_depth {} -> {:#x}{}, dst "
+                     "{:#x} {}x{}x{} layer {} block_depth {} -> {:#x}{}",
+                     regs.src.Address(), regs.src.width, regs.src.height, regs.src.depth,
+                     regs.src.layer, regs.src.block_depth.Value(), src.Address(),
+                     regs.src.layer >= regs.src.depth ? " (layer past depth)" : "",
+                     regs.dst.Address(), regs.dst.width, regs.dst.height, regs.dst.depth,
+                     regs.dst.layer, regs.dst.block_depth.Value(), dst.Address(),
+                     regs.dst.layer >= regs.dst.depth ? " (layer past depth)" : "");
+        }
+    }
     const auto bytes_per_pixel = BytesPerBlock(PixelFormatFromRenderTargetFormat(src.format));
     const bool delegate_to_gpu = src.width > 512 && src.height > 512 && bytes_per_pixel <= 8 &&
                                  src.format != regs.dst.format;
@@ -132,8 +183,8 @@ void Fermi2D::Blit() {
     }
 
     memory_manager.FlushCaching();
-    if (!rasterizer->AccelerateSurfaceCopy(src, regs.dst, config)) {
-        sw_blitter->Blit(src, regs.dst, config);
+    if (!rasterizer->AccelerateSurfaceCopy(src, dst, config)) {
+        sw_blitter->Blit(src, dst, config);
     }
 }
 

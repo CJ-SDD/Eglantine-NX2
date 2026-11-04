@@ -289,6 +289,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, dk_30fps, tr("Donkey Kong Bananza: 30 FPS lock (experimental)"),
            tr("Forces the game's frame rate controller to 30 fps, for a steady rate when 60 "
               "can't be held.\nTakes effect at the next game launch."));
+    INSERT(Settings, mp4_switch2_edition, tr("Metroid Prime 4: Switch 2 Edition mode"),
+           tr("Runs Metroid Prime 4 Beyond as its Switch 2 Edition (the game is told it runs on "
+              "a Switch 2). Off: the Switch 1 version.\nTakes effect at the next game launch."));
     INSERT(Settings, barrier_feedback_loops, tr("Barrier feedback loops"),
            tr("Improves rendering of transparency effects in specific games."));
     INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),

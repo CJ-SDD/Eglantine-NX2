@@ -556,6 +556,12 @@ Result FSP_SRV::OpenDataStorageWithProgramIndex(OutInterface<IStorage> out_inter
     auto patched_romfs = romfs_controller->OpenPatchedRomFSWithProgramIndex(
         program_id, program_index, FileSys::ContentRecordType::Program);
 
+    // Loose ExeFS boots have no installed content to look the program up in; index 0 is the
+    // running program itself (Metroid Prime 4 mounts its RomFS this way).
+    if (!patched_romfs && program_index == 0) {
+        patched_romfs = romfs_controller->OpenRomFSCurrentProcess();
+    }
+
     if (!patched_romfs) {
         // TODO: Find the right error code to use here
         LOG_ERROR(Service_FS, "Could not open storage with program_index={}", program_index);

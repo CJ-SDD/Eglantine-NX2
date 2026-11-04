@@ -615,6 +615,11 @@ struct Values {
     // Donkey Kong Bananza: lock its frame rate controller to 30 fps (loader/nso.cpp).
     SwitchableSetting<bool> dk_30fps{linkage, false, "dk_30fps", Category::RendererAdvanced};
 
+    // Metroid Prime 4: report a Switch 2 to nn::pl::IsRunningOnOunce (loader/nso.cpp), which turns
+    // on the game's Switch 2 Edition mode.
+    SwitchableSetting<bool> mp4_switch2_edition{linkage, true, "mp4_switch2_edition",
+                                                Category::RendererAdvanced};
+
     SwitchableSetting<bool> use_reactive_flushing{linkage,
 #ifdef __ANDROID__
                                                   false,

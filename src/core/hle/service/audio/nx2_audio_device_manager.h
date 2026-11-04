@@ -7,16 +7,21 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <fmt/ranges.h>
 
+#include "audio_core/audio_core.h"
+#include "audio_core/sink/sink.h"
+#include "audio_core/sink/sink_stream.h"
 #include "common/string_util.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -31,26 +36,47 @@ namespace Service::Audio {
 // Switch 2 sound mixer streams (nn::audio::sysmix, behind audsmx:u). A stream is a ring buffer in
 // the game's own memory: CreateStream hands over its address and size (4 KiB aligned), OpenStream
 // its format and length in frames, and once the streams are engaged the system takes frames out of
-// the ring at the stream's sample rate. Eden doesn't mix these into its output yet; it drains the
-// rings in real time so the game sees its audio being played (Switch Sports' menu movie feeds one).
-// The ring's shared indices, in frames modulo (frame count + 1): the system's read index at
-// buffer + 0x44, the game's write index at buffer + 0x1004.
+// the ring at the stream's sample rate. nn::audio::OutputStream (WriteOutputStream) is built on
+// these; Orbitals' UE5 mixer writes its whole stereo f32 mix to one ("OutputStream-0=>2ch48kF32").
+// The sdk lays the ring out itself (OpenStreamImpl, sdk+0x2ab820, and the ring init at
+// sdk+0x2ad500), in frames modulo capacity = frames + 1:
+// - buffer + 0x40: the system's (consumer's) block, read index at +4.
+// - buffer + 0x1000: the game's (producer's) block, write index at +4 (starts at the prefill
+//   count), u32 at +0 counts frames the game could not write.
+// - buffer + 0x1040: with OpenStream flag bit 0, 16 u64 timestamp slots (0x80 bytes) first.
+// - then the frames, interleaved, sample size (1/2/4/4/4 bytes for formats 1-5, sdk+0xbfd7f8)
+//   x channels each.
+// The game is the producer when CreateStream's flags & 7 == 4 (OpenStreamImpl hands that to the
+// ring init as its role); only those streams are played. Eden takes the frames out of the ring in
+// real time (frames owed while a ring is empty are dropped, as an underrun plays silence), converts
+// them to stereo s16 at 48 kHz and queues them on a host output stream.
 struct Nx2SysmixStream {
     u32 id{};
     u32 owner{}; ///< the user session whose timer drains it
+    u32 create_flags{};
     u64 buffer{};
     u64 size{};
     u32 sample_type{};
     u32 channels{};
     u32 sample_rate{};
     u32 frames{};
+    u64 data_offset{}; ///< the frames, from buffer
     bool open{};
     bool engaged{};
+    bool playable{};       ///< format and layout understood, game-produced, host stream exists
+    bool reported_sound{}; ///< the first non-silent frames were logged
+    bool reported_drop{};  ///< frames dropped on a full host queue were logged
+    f32 gain{1.0f};
     double owed_frames{};
+    double resample_position{};
+    std::chrono::nanoseconds last_drain{};
     u32 data_mode{};      ///< command 7's mode; 0 leaves the data event alone
     s32 data_threshold{}; ///< free frames that signal the data event
     Kernel::KEvent* state_event{};
     Kernel::KEvent* data_event{};
+    ::AudioCore::Sink::SinkStream* sink_stream{}; ///< owned by the stream session
+    std::vector<u8> raw;
+    std::vector<s16> pcm;
 };
 
 struct Nx2SysmixStreams {
@@ -64,6 +90,39 @@ struct Nx2SysmixStreams {
 inline std::shared_ptr<Nx2SysmixStreams> Nx2SysmixStreamList() {
     static const auto list = std::make_shared<Nx2SysmixStreams>();
     return list;
+}
+
+// Bytes per sample of nn::audio::SampleFormat (1 s8, 2 s16, 3 s24 in 32 bits, 4 s32, 5 f32): the
+// sdk's table at sdk+0xbfd7f8. 0 for formats sysmix refuses.
+constexpr u32 Nx2SysmixSampleSize(u32 sample_type) {
+    switch (sample_type) {
+    case 1:
+        return 1;
+    case 2:
+        return 2;
+    case 3:
+    case 4:
+    case 5:
+        return 4;
+    default:
+        return 0;
+    }
+}
+
+// Runs the stream's host output while the stream is open, engaged and playable, pauses it
+// otherwise. The caller holds the list lock.
+inline void Nx2SysmixUpdateOutput(Nx2SysmixStream& stream) {
+    auto* const output = stream.sink_stream;
+    if (output == nullptr) {
+        return;
+    }
+    const bool run = stream.open && stream.engaged && stream.playable;
+    if (run && output->IsPaused()) {
+        output->Start();
+    } else if (!run && !output->IsPaused()) {
+        output->Stop();
+        output->ClearQueue();
+    }
 }
 
 // Switch 2 virtual output devices (nn::audio::ListVirtualOutputDevices and friends), reached through
@@ -196,6 +255,8 @@ private:
         if (const auto it = list->streams.find(stream_id); it != list->streams.end()) {
             it->second->engaged = engaged;
             it->second->owed_frames = 0;
+            it->second->last_drain = {};
+            Nx2SysmixUpdateOutput(*it->second);
             if (it->second->state_event) {
                 it->second->state_event->Signal(system.Kernel());
             }
@@ -265,7 +326,9 @@ public:
     }
 
     ~INx2SysmixStreamSession() override {
-        // The drain timer signals these events under the lock: unlist the stream first.
+        // The drain timer signals these events and feeds the host stream under the lock: unlist
+        // the stream first.
+        ::AudioCore::Sink::SinkStream* output{};
         {
             std::scoped_lock lk{streams->mutex};
             streams->streams.erase(stream->id);
@@ -273,10 +336,23 @@ public:
             service_context.CloseEvent(stream->data_event);
             stream->state_event = nullptr;
             stream->data_event = nullptr;
+            stream->playable = false;
+            output = std::exchange(stream->sink_stream, nullptr);
+        }
+        // While the system shuts down the sink closes its streams itself (the audio core may
+        // already be gone when a leaked session is freed late).
+        if (output != nullptr && !system.IsShuttingDown()) {
+            output->Stop();
+            system.AudioCore().GetOutputSink().CloseStream(output);
         }
     }
 
 private:
+    static constexpr u64 FramesOffset = 0x1040;
+    static constexpr u64 TimestampSlotsSize = 0x80; ///< 16 u64 slots, with OpenStream flag bit 0
+    static constexpr u32 ProducerRoleMask = 7;
+    static constexpr u32 GameProducesRole = 4; ///< CreateStream flags & 7: the game writes the ring
+
     // States the session reports: 0 created, 1 open, 2 open and engaged.
     void OpenStream(HLERequestContext& ctx) {
         IPC::RequestParser rp{ctx};
@@ -286,17 +362,37 @@ private:
         const auto frames = rp.Pop<u32>();
         const auto prefill = rp.Pop<u32>();
         const auto flags = rp.Pop<u32>();
+        const u64 data_offset = FramesOffset + ((flags & 1) != 0 ? TimestampSlotsSize : 0);
+        const u64 ring_bytes = static_cast<u64>(Nx2SysmixSampleSize(sample_type)) * channels *
+                               (static_cast<u64>(frames) + 1);
+        const bool game_produces = (stream->create_flags & ProducerRoleMask) == GameProducesRole;
+        const bool understood = game_produces && ring_bytes != 0 && sample_rate != 0 &&
+                                data_offset + ring_bytes <= stream->size;
         LOG_INFO(Service_Audio,
-                 "stream {} open: sample type {}, {} channels, {} Hz, {} frames, prefill {}, flags {:#x}",
-                 stream->id, sample_type, channels, sample_rate, frames, prefill, flags);
+                 "stream {} open: sample type {}, {} channels, {} Hz, {} frames, prefill {}, flags {:#x}, "
+                 "frames at +{:#x}{}",
+                 stream->id, sample_type, channels, sample_rate, frames, prefill, flags, data_offset,
+                 understood ? "" : " (not played: not game-produced, unknown format or ring too small)");
+        // Only this session sets the host stream, so it is read without the lock.
+        auto* output = stream->sink_stream;
+        if (understood && output == nullptr) {
+            output = system.AudioCore().GetOutputSink().AcquireSinkStream(
+                system, 2, fmt::format("nx2:audsmx-{}", stream->id), ::AudioCore::Sink::StreamType::Out);
+        }
         {
             std::scoped_lock lk{streams->mutex};
             stream->sample_type = sample_type;
             stream->channels = channels;
             stream->sample_rate = sample_rate;
             stream->frames = frames;
+            stream->data_offset = data_offset;
             stream->owed_frames = 0;
+            stream->resample_position = 0;
+            stream->last_drain = {};
+            stream->sink_stream = output;
+            stream->playable = understood && output != nullptr;
             stream->open = true;
+            Nx2SysmixUpdateOutput(*stream);
             stream->state_event->Signal(system.Kernel());
         }
         IPC::ResponseBuilder rb{ctx, 2};
@@ -307,6 +403,7 @@ private:
         {
             std::scoped_lock lk{streams->mutex};
             stream->open = false;
+            Nx2SysmixUpdateOutput(*stream);
             stream->state_event->Signal(system.Kernel());
         }
         IPC::ResponseBuilder rb{ctx, 2};
@@ -326,14 +423,25 @@ private:
     }
 
     void GetStreamGain(HLERequestContext& ctx) {
+        f32 gain{};
+        {
+            std::scoped_lock lk{streams->mutex};
+            gain = stream->gain;
+        }
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(gain);
     }
 
+    // The ramp (s64 ns) is ignored: the gain applies from the next frames Eden plays.
     void SetStreamGain(HLERequestContext& ctx) {
         IPC::RequestParser rp{ctx};
-        gain = rp.Pop<f32>();
+        const auto gain = rp.Pop<f32>();
+        LOG_DEBUG(Service_Audio, "stream {} gain {}", stream->id, gain);
+        {
+            std::scoped_lock lk{streams->mutex};
+            stream->gain = std::isfinite(gain) ? std::clamp(gain, 0.0f, 8.0f) : 1.0f;
+        }
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
@@ -380,7 +488,6 @@ private:
     KernelHelpers::ServiceContext service_context;
     std::shared_ptr<Nx2SysmixStreams> streams;
     std::shared_ptr<Nx2SysmixStream> stream;
-    f32 gain{1.0f};
 };
 
 // The session audsmx:u command 0 returns. Commands:
@@ -416,14 +523,119 @@ private:
     static constexpr std::chrono::nanoseconds DrainInterval{std::chrono::milliseconds{5}};
     static constexpr u64 ReadIndexOffset = 0x44;
     static constexpr u64 WriteIndexOffset = 0x1004;
+    static constexpr u32 OutputRate = 48000;
+    /// Host buffers (one per drain, ~5 ms) queued before further frames are dropped.
+    static constexpr u32 MaxQueuedBuffers = 8;
+    /// Longest stretch of late drains made up at once.
+    static constexpr double MaxCatchUpSeconds = 0.05;
 
-    // Takes up to one interval's worth of frames out of each engaged ring (frames owed while a ring
-    // is empty are dropped, as an underrun plays silence), and signals the data event of every open
-    // stream with at least its threshold of free frames, engaged or not: the game fills the ring
-    // before it engages the stream.
+    static f32 ReadSample(const u8* data, u32 sample_type) {
+        switch (sample_type) {
+        case 1: {
+            s8 value{};
+            std::memcpy(&value, data, sizeof(value));
+            return static_cast<f32>(value) / 128.0f;
+        }
+        case 2: {
+            s16 value{};
+            std::memcpy(&value, data, sizeof(value));
+            return static_cast<f32>(value) / 32768.0f;
+        }
+        case 3: {
+            // 24 bits in a 32-bit container; assumed in the low bits (unverified, no game seen).
+            u32 value{};
+            std::memcpy(&value, data, sizeof(value));
+            const s32 extended = static_cast<s32>(value << 8) >> 8;
+            return static_cast<f32>(extended) / 8388608.0f;
+        }
+        case 4: {
+            s32 value{};
+            std::memcpy(&value, data, sizeof(value));
+            return static_cast<f32>(value) / 2147483648.0f;
+        }
+        default: {
+            f32 value{};
+            std::memcpy(&value, data, sizeof(value));
+            return std::isfinite(value) ? value : 0.0f;
+        }
+        }
+    }
+
+    static s16 ToS16(f32 value) {
+        return static_cast<s16>(std::clamp(value * 32767.0f, -32768.0f, 32767.0f));
+    }
+
+    // Reads count frames from the ring at first_frame, converts them to stereo s16 at 48 kHz
+    // (5.1 is folded down, other rates are resampled by nearest frame) and queues them on the
+    // stream's host output. The caller holds the list lock.
+    static void PlayFrames(Core::Memory::Memory& memory, Nx2SysmixStream& stream, u32 first_frame,
+                           u32 count) {
+        const u32 capacity = stream.frames + 1;
+        const u32 sample_size = Nx2SysmixSampleSize(stream.sample_type);
+        const u64 stride = static_cast<u64>(sample_size) * stream.channels;
+        const u64 frames_address = stream.buffer + stream.data_offset;
+        const u32 head = (std::min)(count, capacity - first_frame);
+        stream.raw.resize(static_cast<std::size_t>(stride * count));
+        memory.ReadBlock(frames_address + stride * first_frame, stream.raw.data(),
+                         static_cast<std::size_t>(stride * head));
+        if (head < count) {
+            memory.ReadBlock(frames_address, stream.raw.data() + stride * head,
+                             static_cast<std::size_t>(stride * (count - head)));
+        }
+
+        const double step = static_cast<double>(stream.sample_rate) / OutputRate;
+        const f32 gain = stream.gain;
+        bool audible = false;
+        stream.pcm.clear();
+        for (u32 frame = 0; frame < count; ++frame) {
+            const u8* const samples = stream.raw.data() + stride * frame;
+            f32 left = ReadSample(samples, stream.sample_type);
+            f32 right =
+                stream.channels > 1 ? ReadSample(samples + sample_size, stream.sample_type) : left;
+            if (stream.channels >= 6) {
+                // FL FR FC LFE RL RR
+                const f32 center = 0.707f * ReadSample(samples + 2 * sample_size, stream.sample_type);
+                left += center + 0.707f * ReadSample(samples + 4 * sample_size, stream.sample_type);
+                right += center + 0.707f * ReadSample(samples + 5 * sample_size, stream.sample_type);
+            }
+            const s16 out_left = ToS16(left * gain);
+            const s16 out_right = ToS16(right * gain);
+            audible = audible || out_left != 0 || out_right != 0;
+            while (stream.resample_position < 1.0) {
+                stream.pcm.push_back(out_left);
+                stream.pcm.push_back(out_right);
+                stream.resample_position += step;
+            }
+            stream.resample_position -= 1.0;
+        }
+        if (audible && !stream.reported_sound) {
+            stream.reported_sound = true;
+            LOG_INFO(Service_Audio, "stream {}: first audible frames, playing on the host output",
+                     stream.id);
+        }
+        if (stream.pcm.empty()) {
+            return;
+        }
+        ::AudioCore::Sink::SinkBuffer buffer{
+            .frames = stream.pcm.size() / 2,
+            .frames_played = 0,
+            .tag = 0,
+            .consumed = false,
+        };
+        stream.sink_stream->AppendBuffer(buffer, stream.pcm);
+    }
+
+    // Takes the frames played since the last drain out of each engaged ring (frames owed while a
+    // ring is empty are dropped, as an underrun plays silence) and queues them on the host output.
+    // The rings are always drained in real time, as before host playback existed: when the host
+    // output falls MaxQueuedBuffers behind (or never consumes, as when its backend failed), the
+    // frames are dropped rather than left in the ring, so the game never waits on the host. Then
+    // it signals the data event of every open stream with at least its threshold of free frames,
+    // engaged or not: the game fills the ring before it engages the stream.
     static void Drain(Core::System& system, Nx2SysmixStreams& state, u32 owner) {
         std::scoped_lock lk{state.mutex};
         auto& memory = system.ApplicationMemory();
+        const auto now = system.CoreTiming().GetGlobalTimeNs();
         for (auto& [id, stream] : state.streams) {
             if (stream->owner != owner || !stream->open || stream->frames == 0 || !stream->buffer) {
                 continue;
@@ -436,12 +648,28 @@ private:
             }
             u32 filled = (write + capacity - read) % capacity;
             if (stream->engaged) {
-                stream->owed_frames += stream->sample_rate *
-                                       std::chrono::duration<double>(DrainInterval).count();
+                const auto elapsed =
+                    stream->last_drain.count() == 0 ? DrainInterval : now - stream->last_drain;
+                stream->last_drain = now;
+                stream->owed_frames =
+                    (std::min)(stream->owed_frames +
+                                   stream->sample_rate * std::chrono::duration<double>(elapsed).count(),
+                               stream->sample_rate * MaxCatchUpSeconds);
                 const auto owed = static_cast<u32>(stream->owed_frames);
                 stream->owed_frames -= owed;
                 const u32 taken = (std::min)(filled, owed);
                 if (taken != 0) {
+                    auto* const output = stream->sink_stream;
+                    if (stream->playable && output != nullptr && !output->IsPaused()) {
+                        if (output->GetQueueSize() < MaxQueuedBuffers) {
+                            PlayFrames(memory, *stream, read, taken);
+                        } else if (!stream->reported_drop) {
+                            stream->reported_drop = true;
+                            LOG_WARNING(Service_Audio,
+                                        "stream {}: host output {} buffers behind, dropping frames",
+                                        id, output->GetQueueSize());
+                        }
+                    }
                     memory.Write32(stream->buffer + ReadIndexOffset, (read + taken) % capacity);
                     filled -= taken;
                 }
@@ -463,6 +691,7 @@ private:
         const auto size = rp.Pop<u64>();
         const auto name = Common::StringFromBuffer(ctx.ReadBuffer(0));
         auto stream = std::make_shared<Nx2SysmixStream>();
+        stream->create_flags = flags;
         stream->buffer = buffer;
         stream->size = size;
         {
@@ -489,6 +718,8 @@ private:
                 if (const auto it = streams->streams.find(id); it != streams->streams.end()) {
                     it->second->engaged = engaged;
                     it->second->owed_frames = 0;
+                    it->second->last_drain = {};
+                    Nx2SysmixUpdateOutput(*it->second);
                     if (it->second->state_event) {
                         it->second->state_event->Signal(system.Kernel());
                     }

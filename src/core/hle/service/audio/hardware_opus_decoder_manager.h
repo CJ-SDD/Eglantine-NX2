@@ -13,6 +13,7 @@
 namespace Service::Audio {
 
 class IHardwareOpusDecoder;
+class INx2HardwareAudioCodecClientSession;
 
 using AudioCore::OpusDecoder::OpusMultiStreamParameters;
 using AudioCore::OpusDecoder::OpusMultiStreamParametersEx;
@@ -48,6 +49,8 @@ private:
     Result GetWorkBufferSizeExEx(Out<u32> out_size, OpusParametersEx params);
     Result GetWorkBufferSizeForMultiStreamExEx(
         Out<u32> out_size, InLargeData<OpusMultiStreamParametersEx, BufferAttr_HipcPointer> params);
+    Result GetHardwareAudioCodecClientSession(
+        Out<SharedPointer<INx2HardwareAudioCodecClientSession>> out_session);
 
     Core::System& system;
     AudioCore::OpusDecoder::OpusDecoderManager impl;

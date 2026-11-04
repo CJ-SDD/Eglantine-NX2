@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <thread>
 #include <chrono>
@@ -1620,6 +1621,7 @@ public:
             {1, &INx2Vi2Session::ReturnOne, "Unknown1"},
             {3, &INx2Vi2Session::ReturnOne, "GetDisplayCount (guessed)"},
             {5, &INx2Vi2Session::GetTimestampRecorderCount, "GetTimestampRecorderCount (guessed)"},
+            {53, &INx2Vi2Session::GetRecordedTimestamps, "GetRecordedTimestamps"},
             {11, &INx2Vi2Session::GetNotificationEvent, "GetNotificationEvent"},
             {13, &INx2Vi2Session::SucceedQuietly, "ReleaseNotificationEvent"},
             {21, &INx2Vi2Session::GetNotifications, "GetNotifications"},
@@ -1704,8 +1706,8 @@ private:
         ++m_presents;
         Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
         if (m_presents <= 4 || (m_presents % 600) == 0) {
-            LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
-                     u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);
+            LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={} words {:08x}", m_presents,
+                     u64{w[2]} | (u64{w[3]} << 32), w[4], w[5], fmt::join(std::span{w, 32}, " "));
         }
         // Wait for this frame's fence, so the game doesn't write the next frame's data (constant
         // buffers holding texture handles, vertex data, Pokopia's glyph atlas) while the GPU
@@ -1808,9 +1810,14 @@ private:
                 m_stats = {.last_present = entered};
             }
         }
+        // Words 5-8 of the reply are the frame's release fence (a SyncPointHandle, encoded like
+        // request words 22-25). nn::vi::detail::LayerHistory (Unreal's frame pacing) waits on it
+        // before reusing one of its 7 timestamp recorders; zeroes decode as syncpoint ~0, which
+        // never signals, so Orbitals froze after 7 frames. Hand back the frame's own GPU fence:
+        // the buffer is free once the GPU is done with it.
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
-                             static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+                             static_cast<u32>(AvailableSlots >> 32), w[22], w[23], w[24], w[25]});
     }
 
     // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
@@ -2205,6 +2212,25 @@ private:
     void GetTimestampRecorderCount(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:vi2 TIPC 5, returning 7");
         TipcReplyWords(ctx, {7});
+    }
+
+    // 53(B: u64 timestamps, u32 recorder, u64 checkpoint mask, u32 capacity): the times a
+    // recorder's frame passed each checkpoint, one u64 tick per mask bit in bit order. Reply: u64
+    // bytes written, u8 "more to come". nn::vi::detail::LayerHistory (Unreal's frame pacing)
+    // marks a frame displayed only with these; zeroes stalled Orbitals after 7 frames. The query
+    // comes after the frame's release fence passed, so "now" stands in for every checkpoint.
+    void GetRecordedTimestamps(HLERequestContext& ctx) {
+        // Header (2 words) and the B descriptor (3 words), then recorder index, mask, capacity.
+        const auto* w = ctx.CommandBuffer();
+        const u64 mask = u64{w[6]} | (u64{w[7]} << 32);
+        const size_t capacity = ctx.GetWriteBufferSize() / sizeof(u64);
+        const size_t count = (std::min<size_t>)(std::popcount(mask), capacity);
+        const std::vector<u64> ticks(count, (std::max<u64>)(system.CoreTiming().GetClockTicks(), 1));
+        if (count != 0) {
+            ctx.WriteBuffer(ticks.data(), count * sizeof(u64));
+        }
+        const u64 bytes = count * sizeof(u64);
+        TipcReplyWords(ctx, {static_cast<u32>(bytes), static_cast<u32>(bytes >> 32), 0});
     }
 
     // 11: the notification event the SDK's render thread waits on while it tears a client down.

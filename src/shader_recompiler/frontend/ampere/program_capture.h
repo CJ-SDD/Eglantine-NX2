@@ -32,7 +32,9 @@ public:
             if (opcode == 0x947 && computed_branch && instruction.Bits(12, 4) == 7 &&
                 target == s64{index} * 16)
                 return Result::Complete;
+            if (opcode == 0x947 && target == s64{index} * 16) NoteReachableEnd(instruction, index);
         }
+        if (opcode == 0x950) NoteReachableEnd(instruction, index);
         if (opcode == 0x949 || opcode == 0x958) computed_branch = true;
         if (computed_branch) return Result::Continue;
         if (opcode == 0x94d && instruction.Bits(12, 4) == 7 && index >= last_forward_target) {
@@ -45,9 +47,29 @@ public:
         return Result::Continue;
     }
 
+    static constexpr u32 NoReachableEnd = ~0U;
+
+    // The first unconditional RET or branch-to-self that no earlier branch, BSSY or call targets
+    // past (NoReachableEnd if none): nothing after it can run. The rules above can miss the end
+    // (a NOINC call counts as a forward branch, so neither the main EXIT before the library
+    // function nor the function's closing RET.REL.NODEC ends the capture); a program followed by
+    // another one still completes at that one's EXIT, but one followed by data runs into it.
+    [[nodiscard]] u32 ReachableEnd() const {
+        return reachable_end;
+    }
+
 private:
+    void NoteReachableEnd(const Instruction& instruction, u32 index) {
+        // A jump table's targets are unknown; @P/@!P or a second condition (87..90) falls through.
+        if (reachable_end != NoReachableEnd || computed_branch || instruction.Bits(12, 4) != 7 ||
+            instruction.Bits(87, 4) != 7)
+            return;
+        if (index >= last_forward_target && index >= last_call_target) reachable_end = index;
+    }
+
     u32 last_call_target{};
     u32 last_forward_target{};
+    u32 reachable_end{NoReachableEnd};
     bool main_exited{};
     bool computed_branch{};
 };

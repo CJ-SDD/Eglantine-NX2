@@ -6,6 +6,7 @@
 
 #include "core/hle/service/audio/hardware_opus_decoder.h"
 #include "core/hle/service/audio/hardware_opus_decoder_manager.h"
+#include "core/hle/service/audio/nx2_hardware_audio_codec.h"
 #include "core/hle/service/cmif_serialization.h"
 
 namespace Service::Audio {
@@ -26,6 +27,7 @@ IHardwareOpusDecoderManager::IHardwareOpusDecoderManager(Core::System& system_)
         {7, D<&IHardwareOpusDecoderManager::GetWorkBufferSizeForMultiStreamEx>, "GetWorkBufferSizeForMultiStreamEx"},
         {8, D<&IHardwareOpusDecoderManager::GetWorkBufferSizeExEx>, "GetWorkBufferSizeExEx"},
         {9, D<&IHardwareOpusDecoderManager::GetWorkBufferSizeForMultiStreamExEx>, "GetWorkBufferSizeForMultiStreamExEx"},
+        {100, D<&IHardwareOpusDecoderManager::GetHardwareAudioCodecClientSession>, "GetHardwareAudioCodecClientSession (Switch 2, guessed)"},
     };
     // clang-format on
     RegisterHandlers(functions);
@@ -153,6 +155,13 @@ Result IHardwareOpusDecoderManager::GetWorkBufferSizeForMultiStreamExEx(
     Out<u32> out_size, InLargeData<OpusMultiStreamParametersEx, BufferAttr_HipcPointer> params) {
     R_TRY(impl.GetWorkBufferSizeForMultiStreamExEx(*params, *out_size));
     LOG_DEBUG(Service_Audio, "size {:#x}", *out_size);
+    R_SUCCEED();
+}
+
+Result IHardwareOpusDecoderManager::GetHardwareAudioCodecClientSession(
+    Out<SharedPointer<INx2HardwareAudioCodecClientSession>> out_session) {
+    LOG_INFO(Service_Audio, "Switch 2 hwopus 100, returning the hardware audio codec session");
+    *out_session = std::make_shared<INx2HardwareAudioCodecClientSession>(system);
     R_SUCCEED();
 }
 

@@ -426,6 +426,15 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         native.push_back(instruction);
         const auto status = capture.Observe(instruction, index);
         if (status == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget) {
+            // The capture missed the program's end and ran into the data after it: end the
+            // program at its last reachable instruction. (Only programs that would be rejected
+            // here take this path; those whose capture completes keep their current bounds.)
+            if (const u32 reachable_end = capture.ReachableEnd(); reachable_end < index) {
+                LOG_DEBUG(Shader, "Native shader at {:#x}: capture ends at its closing instruction +{:#x}",
+                          program_base + native_header_size, reachable_end * 16);
+                native.resize(static_cast<size_t>(reachable_end) + 1);
+                break;
+            }
             if (const char* dir = std::getenv("EDEN_NX2_SHADER_DUMP")) {
                 const auto path = fmt::format("{}/rejected-{:x}.bin", dir, program_base + native_header_size);
                 if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
