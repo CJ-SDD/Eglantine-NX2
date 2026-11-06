@@ -453,6 +453,27 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     const std::string_view tensor_mode =
         tensor_override ? tensor_override : (native_tensor_full_by_default ? "full" : "");
     auto lowered = Shader::Ampere::LowerToMaxwell(native, tensor_mode);
+    // The capture can also run past a program's closing instruction without meeting a bad
+    // branch (padding such as 0xaaaaaaaa, or a table after the code): the lowering then fails on
+    // an opcode nothing can reach. When the failure lies past the last reachable instruction,
+    // lower again with the program ending there. Only programs that would be rejected take this
+    // path (Orbitals: a stage 1 program at +0xc0, a compute program at +0xac0).
+    if (!lowered) {
+        const u32 reachable_end = capture.ReachableEnd();
+        if (reachable_end != Shader::Ampere::ProgramCaptureState::NoReachableEnd &&
+            static_cast<size_t>(reachable_end) + 1 < native.size() &&
+            lowered.error_offset > reachable_end * sizeof(Instruction)) {
+            auto retry = Shader::Ampere::LowerToMaxwell(
+                std::span<const Instruction>{native.data(), static_cast<size_t>(reachable_end) + 1},
+                tensor_mode);
+            if (retry) {
+                LOG_INFO(Shader, "Native shader at {:#x}: ends at its closing instruction +{:#x} ({} past it)",
+                         program_base + native_header_size, reachable_end * 16, lowered.error);
+                native.resize(static_cast<size_t>(reachable_end) + 1);
+                lowered = std::move(retry);
+            }
+        }
+    }
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {

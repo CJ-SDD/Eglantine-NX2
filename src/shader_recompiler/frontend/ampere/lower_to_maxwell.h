@@ -1706,8 +1706,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // Truncating conversion to an 8- or 16-bit integer (destination size, bits 75-76, = 0 or 1).
             const bool byte = (mode & ~0x100U) == 0x0021e000;
             const bool short_word = (mode & ~0x100U) == 0x0021e800;
+            // Bits 62/63 are |source| and -source, as for the other float operands.
             if ((!half && !small && !word && !byte && !short_word) ||
-                (opcode != 0xb05 && (insn.words[1] & 0xffffff00U)) ||
+                (opcode != 0xb05 && (insn.words[1] & 0x3fffff00U)) ||
                 (opcode == 0xd05 && uniform_register(insn.Bits(32, 8)) == ~0U)) {
                 return fail(index, "native float-to-integer conversion mode");
             }
@@ -1716,6 +1717,15 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                        : opcode == 0xd05 ? uniform_register(insn.Bits(32, 8)) : insn.Bits(32, 8);
             if (half) {
                 extract_half({source, 2, false, false}, 0, 252);
+                source = 252;
+            }
+            if (insn.Bits(62, 2)) {
+                // Apply the source modifiers first (F2F.F32.F32 with no rounding: |x| and -x),
+                // so the NaN/range clamps below see the value being converted (Orbitals: F2I
+                // of |R43|).
+                emit(0x5ca8000000000000ULL | predicate | 252 | (u64{2} << 8) | (u64{2} << 10) |
+                     (u64{source} << 20) | (u64{insn.Bits(63, 1)} << 45) |
+                     (u64{insn.Bits(62, 1)} << 49));
                 source = 252;
             }
             if (!is_signed) {
